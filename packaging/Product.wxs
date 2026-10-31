@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Macro Recorder"
+    Manufacturer="Macro Recorder"
+    Version="1.0.0"
+    UpgradeCode="A7C3E91F-4B2D-4E8A-9F1C-6D5B8A0E3C27"
+    Language="1033"
+    Scope="perMachine">
+    <SummaryInformation Description="Record and replay keyboard and mouse input on Windows." />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Macro Recorder is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="MacroRecorder" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Macro Recorder" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Macro Recorder" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.App)\**" />
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="B8D4F02A-5C3E-4F9B-A0E2-7E6C9B1F4D38">
+      <Shortcut
+        Id="MacroRecorderStartMenu"
+        Name="Macro Recorder"
+        Description="Record and replay keyboard and mouse input"
+        Target="[INSTALLFOLDER]MacroRecorder.exe"
+        WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\MacroRecorder"
+        Name="installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

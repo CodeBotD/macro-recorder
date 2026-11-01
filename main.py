@@ -7,7 +7,13 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+import appdata
+import theme
+import updater
+from version import APP_VERSION
 
 
 def enable_dpi_awareness():
@@ -41,6 +47,7 @@ from pynput.keyboard import Key, KeyCode
 from pynput.mouse import Button
 
 MOVE_INTERVAL = 1 / 60
+UPDATE_INTERVAL_MS = 30 * 60 * 1000
 
 
 def hotkey_name(key):
@@ -97,6 +104,15 @@ def valid_event(event):
     return isinstance(event.get("dt"), (int, float))
 
 
+def read_recording(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    events = payload["events"]
+    if not isinstance(events, list) or not all(valid_event(event) for event in events):
+        raise ValueError("invalid events")
+    return events
+
+
 class RecorderApp:
     def __init__(self):
         self.events = []
@@ -114,6 +130,12 @@ class RecorderApp:
         self.pass_loop = False
         self.dirty = False
         self.ui_queue = queue.Queue()
+        self.current_macro = None
+        self.settings = appdata.load_settings()
+        self.pending_update = None
+        self.update_in_progress = False
+        self._update_timer = None
+        self.window_focused = True
 
         self.mouse_ctl = mouse.Controller()
         self.key_ctl = keyboard.Controller()
@@ -121,19 +143,30 @@ class RecorderApp:
         self.key_listener = None
 
         self.root = tk.Tk()
-        self.root.title("Macro recorder")
-        self.root.minsize(420, 260)
+        self.root.title(f"Macro recorder v{APP_VERSION}")
+        self.root.minsize(480, 420)
         self.status_var = tk.StringVar(value="Idle — 0 events")
         self.repeat_var = tk.StringVar(value="1")
         self.loop_var = tk.BooleanVar(value=False)
+        self.dark_mode_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
+        self.check_updates_var = tk.BooleanVar(
+            value=bool(self.settings.get("check_for_updates", True))
+        )
         self._build_ui()
+        self._apply_theme()
+        self._refresh_macro_list(select_name=self.settings.get("last_macro"))
         self._start_listeners()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<FocusIn>", self._on_focus_in)
+        self.root.bind("<FocusOut>", self._on_focus_out)
         self.root.after(50, self._pump)
+        self.root.after(200, self._autoload_last_macro)
+        self.root.after(1500, self._start_update_schedule)
 
     def _build_ui(self):
         frame = ttk.Frame(self.root, padding=12)
         frame.pack(fill="both", expand=True)
+        self.main_frame = frame
 
         ttk.Label(frame, textvariable=self.status_var, font=("Segoe UI", 12)).pack(anchor="w")
         ttk.Label(
@@ -161,19 +194,283 @@ class RecorderApp:
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=16)
         ttk.Button(buttons, text="Record (F6)", command=self.toggle_record).pack(side="left")
-        ttk.Button(buttons, text="Play (F7)", command=self.toggle_playback).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Play (F7)", command=self.toggle_playback).pack(
+            side="left", padx=8
+        )
         ttk.Button(buttons, text="Stop (F8)", command=self.stop_all).pack(side="left")
 
-        files = ttk.Frame(frame)
-        files.pack(fill="x")
-        ttk.Button(files, text="Save", command=self.save_recording).pack(side="left")
-        ttk.Button(files, text="Load", command=self.load_recording).pack(side="left", padx=8)
+        library = ttk.LabelFrame(frame, text="Macros", padding=8)
+        library.pack(fill="both", expand=True, pady=(0, 8))
+
+        list_row = ttk.Frame(library)
+        list_row.pack(fill="both", expand=True)
+        self.macro_list = tk.Listbox(list_row, height=8, exportselection=False)
+        scroll = ttk.Scrollbar(list_row, orient="vertical", command=self.macro_list.yview)
+        self.macro_list.configure(yscrollcommand=scroll.set)
+        self.macro_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.macro_list.bind("<Double-Button-1>", lambda _e: self.load_selected_macro())
+
+        file_btns = ttk.Frame(library)
+        file_btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(file_btns, text="Save", command=self.save_macro).pack(side="left")
+        ttk.Button(file_btns, text="Save As", command=self.save_macro_as).pack(
+            side="left", padx=6
+        )
+        ttk.Button(file_btns, text="Load", command=self.load_selected_macro).pack(side="left")
+        ttk.Button(file_btns, text="Export…", command=self.export_macro).pack(
+            side="left", padx=(12, 6)
+        )
+        ttk.Button(file_btns, text="Import…", command=self.import_macro).pack(side="left")
+
+        settings = ttk.LabelFrame(frame, text="Settings", padding=8)
+        settings.pack(fill="x")
+        ttk.Checkbutton(
+            settings,
+            text="Dark mode",
+            variable=self.dark_mode_var,
+            command=self._on_dark_mode_toggle,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            settings,
+            text="Check for updates",
+            variable=self.check_updates_var,
+            command=self._on_check_updates_toggle,
+        ).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(
             frame,
-            wraplength=390,
+            wraplength=440,
             text="Hooks miss elevated apps. Run this recorder as administrator to control them.",
-        ).pack(anchor="w", pady=(16, 0))
+        ).pack(anchor="w", pady=(12, 0))
+
+    def _apply_theme(self):
+        theme.apply_theme(self.root, bool(self.dark_mode_var.get()), self.macro_list)
+
+    def _persist_settings(self):
+        self.settings["dark_mode"] = bool(self.dark_mode_var.get())
+        self.settings["check_for_updates"] = bool(self.check_updates_var.get())
+        self.settings["last_macro"] = self.current_macro
+        appdata.save_settings(self.settings)
+
+    def _on_dark_mode_toggle(self):
+        self._apply_theme()
+        self._persist_settings()
+
+    def _on_check_updates_toggle(self):
+        enabled = bool(self.check_updates_var.get())
+        self._persist_settings()
+        if not enabled:
+            self.pending_update = None
+            self._cancel_update_timer()
+        else:
+            self._start_update_schedule()
+
+    def _refresh_macro_list(self, select_name=None):
+        names = appdata.list_macros()
+        self.macro_list.delete(0, tk.END)
+        for name in names:
+            self.macro_list.insert(tk.END, name)
+        target = select_name or self.current_macro
+        if target and target in names:
+            index = names.index(target)
+            self.macro_list.selection_clear(0, tk.END)
+            self.macro_list.selection_set(index)
+            self.macro_list.see(index)
+
+    def _selected_macro_name(self):
+        selection = self.macro_list.curselection()
+        if not selection:
+            return None
+        return self.macro_list.get(selection[0])
+
+    def _set_current_macro(self, name):
+        self.current_macro = name
+        self.settings["last_macro"] = name
+        appdata.save_settings(self.settings)
+        self._refresh_macro_list(select_name=name)
+
+    def _recording_payload(self):
+        with self.lock:
+            if self.state == "recording":
+                self._flush_pending_move()
+            return {"events": [dict(event) for event in self.events]}
+
+    def _write_macro_file(self, name, payload):
+        path = appdata.macro_path(name)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        self._set_current_macro(path.name)
+        self.refresh_status()
+
+    def save_macro(self):
+        payload = self._recording_payload()
+        if not payload["events"]:
+            self.status_var.set("Nothing to save")
+            return
+        if self.current_macro:
+            self._write_macro_file(self.current_macro, payload)
+            return
+        self.save_macro_as()
+
+    def save_macro_as(self):
+        payload = self._recording_payload()
+        if not payload["events"]:
+            self.status_var.set("Nothing to save")
+            return
+        suggested = Path(self.current_macro).stem if self.current_macro else "macro"
+        name = simpledialog.askstring(
+            "Save As",
+            "Macro name:",
+            initialvalue=suggested,
+            parent=self.root,
+        )
+        safe = appdata.sanitize_macro_name(name or "")
+        if not safe:
+            return
+        path = appdata.macro_path(safe)
+        if path.exists():
+            if not messagebox.askyesno(
+                "Macro recorder",
+                f'"{safe}" already exists. Overwrite?',
+                parent=self.root,
+            ):
+                return
+        self._write_macro_file(safe, payload)
+
+    def load_selected_macro(self):
+        name = self._selected_macro_name()
+        if not name:
+            messagebox.showinfo("Macro recorder", "Select a macro to load.", parent=self.root)
+            return
+        self._load_macro_file(appdata.macro_path(name), set_current=True)
+
+    def _load_macro_file(self, path, set_current):
+        with self.lock:
+            busy = self.state != "idle"
+        if busy:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Stop recording or playback before loading.",
+                parent=self.root,
+            )
+            return False
+        try:
+            events = read_recording(path)
+        except Exception:
+            messagebox.showerror(
+                "Macro recorder",
+                "That file is not a recording.",
+                parent=self.root,
+            )
+            return False
+        with self.lock:
+            if self.state != "idle":
+                return False
+            self.events = events
+            self.pending_pos = None
+        if set_current:
+            self._set_current_macro(Path(path).name)
+        self.refresh_status()
+        return True
+
+    def _autoload_last_macro(self):
+        name = self.settings.get("last_macro")
+        if not name:
+            return
+        path = appdata.macro_path(name)
+        if path.is_file():
+            self._load_macro_file(path, set_current=True)
+
+    def export_macro(self):
+        payload = self._recording_payload()
+        if not payload["events"]:
+            # Prefer exporting the selected library file if buffer empty
+            name = self._selected_macro_name() or self.current_macro
+            if not name:
+                self.status_var.set("Nothing to export")
+                return
+            path = appdata.macro_path(name)
+            if not path.is_file():
+                self.status_var.set("Nothing to export")
+                return
+            try:
+                events = read_recording(path)
+            except Exception:
+                messagebox.showerror(
+                    "Macro recorder",
+                    "That file is not a recording.",
+                    parent=self.root,
+                )
+                return
+            payload = {"events": events}
+            initial = name
+        else:
+            initial = self.current_macro or "macro.json"
+        dest = filedialog.asksaveasfilename(
+            parent=self.root,
+            defaultextension=".json",
+            filetypes=[("JSON recording", "*.json")],
+            initialfile=initial,
+            title="Export macro",
+        )
+        if not dest:
+            return
+        with open(dest, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    def import_macro(self):
+        with self.lock:
+            busy = self.state != "idle"
+        if busy:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Stop recording or playback before importing.",
+                parent=self.root,
+            )
+            return
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            filetypes=[("JSON recording", "*.json")],
+            title="Import macro",
+        )
+        if not source:
+            return
+        try:
+            events = read_recording(source)
+        except Exception:
+            messagebox.showerror(
+                "Macro recorder",
+                "That file is not a recording.",
+                parent=self.root,
+            )
+            return
+        suggested = Path(source).stem
+        name = simpledialog.askstring(
+            "Import",
+            "Save imported macro as:",
+            initialvalue=suggested,
+            parent=self.root,
+        )
+        safe = appdata.sanitize_macro_name(name or "")
+        if not safe:
+            return
+        path = appdata.macro_path(safe)
+        if path.exists():
+            if not messagebox.askyesno(
+                "Macro recorder",
+                f'"{safe}" already exists. Overwrite?',
+                parent=self.root,
+            ):
+                return
+        payload = {"events": events}
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        with self.lock:
+            self.events = [dict(event) for event in events]
+            self.pending_pos = None
+        self._set_current_macro(safe)
+        self.refresh_status()
 
     def _start_listeners(self):
         self.mouse_listener = mouse.Listener(
@@ -220,6 +517,8 @@ class RecorderApp:
                 text = f"Playing — pass {pass_index} of {pass_total}"
         else:
             text = f"Idle — {count} events"
+        if self.current_macro:
+            text = f"{text}  [{self.current_macro}]"
         self.status_var.set(text)
 
     def _post(self, fn):
@@ -349,6 +648,7 @@ class RecorderApp:
                 self.pending_pos = None
                 self.state = "recording"
         self.refresh_status()
+        self._maybe_apply_pending_update()
 
     def _repeat_settings(self):
         try:
@@ -391,6 +691,7 @@ class RecorderApp:
                 self._flush_pending_move()
                 self.state = "idle"
         self.refresh_status()
+        self._maybe_apply_pending_update()
 
     def _play(self, events, repeat, loop):
         try:
@@ -413,6 +714,7 @@ class RecorderApp:
                 if self.state == "playing":
                     self.state = "idle"
             self._mark_dirty()
+            self._post(self._maybe_apply_pending_update)
 
     def _play_once(self, events):
         held_keys = []
@@ -471,59 +773,121 @@ class RecorderApp:
                 pass
         held_buttons.clear()
 
-    def save_recording(self):
-        with self.lock:
-            if self.state == "recording":
-                self._flush_pending_move()
-            payload = {"events": [dict(event) for event in self.events]}
-        if not payload["events"]:
-            self.status_var.set("Nothing to save")
-            return
-        path = filedialog.asksaveasfilename(
-            parent=self.root,
-            defaultextension=".json",
-            filetypes=[("JSON recording", "*.json")],
-            title="Save recording",
-        )
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        self.refresh_status()
+    def _on_focus_in(self, _event=None):
+        self.window_focused = True
+        self._maybe_apply_pending_update()
 
-    def load_recording(self):
-        with self.lock:
-            if self.state != "idle":
-                busy = True
-            else:
-                busy = False
-        if busy:
-            messagebox.showinfo("Macro recorder", "Stop recording or playback before loading.")
-            return
-        path = filedialog.askopenfilename(
-            parent=self.root,
-            filetypes=[("JSON recording", "*.json")],
-            title="Load recording",
-        )
-        if not path:
-            return
+    def _on_focus_out(self, _event=None):
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            events = payload["events"]
-            if not isinstance(events, list) or not all(valid_event(event) for event in events):
-                raise ValueError("invalid events")
-        except Exception:
-            messagebox.showerror("Macro recorder", "That file is not a recording.")
+            focused = self.root.focus_displayof()
+        except tk.TclError:
+            focused = None
+        self.window_focused = focused is not None
+
+    def _cancel_update_timer(self):
+        if self._update_timer is not None:
+            try:
+                self.root.after_cancel(self._update_timer)
+            except Exception:
+                pass
+            self._update_timer = None
+
+    def _start_update_schedule(self):
+        self._cancel_update_timer()
+        if not bool(self.check_updates_var.get()):
+            return
+        self._run_update_check_async()
+        self._update_timer = self.root.after(UPDATE_INTERVAL_MS, self._on_update_timer)
+
+    def _on_update_timer(self):
+        self._update_timer = None
+        if not bool(self.check_updates_var.get()):
+            return
+        self._run_update_check_async()
+        self._update_timer = self.root.after(UPDATE_INTERVAL_MS, self._on_update_timer)
+
+    def _run_update_check_async(self):
+        if not bool(self.check_updates_var.get()):
+            return
+
+        def worker():
+            pending = updater.check_latest()
+            self._post(lambda: self._on_update_check_result(pending))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_result(self, pending):
+        if not bool(self.check_updates_var.get()):
+            self.pending_update = None
+            return
+        self.pending_update = pending
+        self._maybe_apply_pending_update()
+
+    def _maybe_apply_pending_update(self):
+        if self.update_in_progress:
+            return
+        if not bool(self.check_updates_var.get()):
+            return
+        if self.pending_update is None:
+            return
+        if not self.window_focused:
             return
         with self.lock:
-            if self.state != "idle":
-                return
-            self.events = events
-            self.pending_pos = None
-        self.refresh_status()
+            idle = self.state == "idle"
+        if not idle:
+            return
+        pending = self.pending_update
+        self.pending_update = None
+        self.update_in_progress = True
+        self._begin_update(pending)
+
+    def _begin_update(self, pending):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Updating")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        ttk.Label(
+            dialog,
+            text=f"Updating to v{pending.version}…",
+            padding=16,
+        ).pack()
+        status = tk.StringVar(value="Downloading installer…")
+        ttk.Label(dialog, textvariable=status, padding=(16, 0, 16, 16)).pack()
+        dialog.update_idletasks()
+
+        def worker():
+            msi_path = None
+            try:
+                msi_path = updater.download_msi(pending.download_url)
+                self._post(lambda: status.set("Starting installer…"))
+                updater.launch_msi_installer(msi_path)
+                self._post(self._quit_for_update)
+            except Exception:
+                def fail():
+                    self.update_in_progress = False
+                    try:
+                        dialog.destroy()
+                    except tk.TclError:
+                        pass
+                    if msi_path:
+                        try:
+                            Path(msi_path).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    # Keep quiet for macros; surface a soft status line only.
+                    self.status_var.set("Update failed — try again later")
+
+                self._post(fail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _quit_for_update(self):
+        self.on_close()
 
     def on_close(self):
+        self._cancel_update_timer()
+        self._persist_settings()
         self.stop_event.set()
         if self.mouse_listener is not None:
             self.mouse_listener.stop()
@@ -539,6 +903,7 @@ def main():
     if sys.platform != "win32":
         print("This recorder is for Windows.")
         return
+    appdata.macros_dir()
     app = RecorderApp()
     app.run()
 

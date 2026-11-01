@@ -3,7 +3,7 @@
   <Package
     Name="Macro Recorder"
     Manufacturer="Macro Recorder"
-    Version="1.0.0"
+    Version="$(var.ProductVersion)"
     UpgradeCode="A7C3E91F-4B2D-4E8A-9F1C-6D5B8A0E3C27"
     Language="1033"
     Scope="perMachine">

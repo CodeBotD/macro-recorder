@@ -12,7 +12,7 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Macro Recorder is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <Icon Id="AppIcon" SourceFile="..\assets\app-icon.ico" />
+    <Icon Id="AppIcon" SourceFile="assets\app-icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">

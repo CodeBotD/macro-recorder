@@ -12,6 +12,9 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Macro Recorder is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <Icon Id="AppIcon" SourceFile="..\assets\app-icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="MacroRecorder" />
     </StandardDirectory>
@@ -35,7 +38,8 @@
         Name="Macro Recorder"
         Description="Record and replay keyboard and mouse input"
         Target="[INSTALLFOLDER]MacroRecorder.exe"
-        WorkingDirectory="INSTALLFOLDER" />
+        WorkingDirectory="INSTALLFOLDER"
+        Icon="AppIcon" />
       <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
       <RegistryValue
         Root="HKCU"

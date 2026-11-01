@@ -11,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import appdata
+import hotkeys
 import theme
 import updater
 from version import APP_VERSION
@@ -48,16 +49,12 @@ from pynput.mouse import Button
 
 MOVE_INTERVAL = 1 / 60
 UPDATE_INTERVAL_MS = 30 * 60 * 1000
+MACRO_LIST_MAX_ROWS = 8
 
 
-def hotkey_name(key):
-    if key == Key.f6 or getattr(key, "vk", None) == 0x75:
-        return "f6"
-    if key == Key.f7 or getattr(key, "vk", None) == 0x76:
-        return "f7"
-    if key == Key.f8 or getattr(key, "vk", None) == 0x77:
-        return "f8"
-    return None
+def resource_path(*parts: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base.joinpath(*parts)
 
 
 def encode_key(key):
@@ -125,6 +122,7 @@ class RecorderApp:
         self.last_recorded_pos = None
         self.pending_pos = None
         self.hotkeys_down = set()
+        self.mods_down = set()
         self.pass_index = 0
         self.pass_total = 1
         self.pass_loop = False
@@ -132,10 +130,15 @@ class RecorderApp:
         self.ui_queue = queue.Queue()
         self.current_macro = None
         self.settings = appdata.load_settings()
+        self.hotkey_map = hotkeys.normalize_hotkeys(self.settings.get("hotkeys"))
         self.pending_update = None
         self.update_in_progress = False
         self._update_timer = None
         self.window_focused = True
+        self._capture_action = None
+        self._capture_callback = None
+        self._rounded_buttons = []
+        self._colors = theme.LIGHT
 
         self.mouse_ctl = mouse.Controller()
         self.key_ctl = keyboard.Controller()
@@ -145,7 +148,9 @@ class RecorderApp:
         self.root = tk.Tk()
         self.root.title(f"Macro recorder v{APP_VERSION}")
         self.root.minsize(480, 420)
+        self._set_app_icon()
         self.status_var = tk.StringVar(value="Idle — 0 events")
+        self.hotkey_hint_var = tk.StringVar(value=hotkeys.format_hotkeys_hint(self.hotkey_map))
         self.repeat_var = tk.StringVar(value="1")
         self.loop_var = tk.BooleanVar(value=False)
         self.dark_mode_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
@@ -154,6 +159,7 @@ class RecorderApp:
         )
         self._build_ui()
         self._apply_theme()
+        self._refresh_hotkey_labels()
         self._refresh_macro_list(select_name=self.settings.get("last_macro"))
         self._start_listeners()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -163,16 +169,36 @@ class RecorderApp:
         self.root.after(200, self._autoload_last_macro)
         self.root.after(1500, self._start_update_schedule)
 
+    def _set_app_icon(self):
+        png = resource_path("assets", "app-icon.png")
+        ico = resource_path("assets", "app-icon.ico")
+        try:
+            if png.is_file():
+                self._icon_image = tk.PhotoImage(file=str(png))
+                self.root.iconphoto(True, self._icon_image)
+        except Exception:
+            self._icon_image = None
+        try:
+            if ico.is_file():
+                self.root.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+
+    def _hwnd(self) -> int:
+        try:
+            return int(self.root.winfo_id())
+        except Exception:
+            return 0
+
     def _build_ui(self):
-        frame = ttk.Frame(self.root, padding=12)
+        frame = ttk.Frame(self.root, padding=14)
         frame.pack(fill="both", expand=True)
         self.main_frame = frame
 
         ttk.Label(frame, textvariable=self.status_var, font=("Segoe UI", 12)).pack(anchor="w")
-        ttk.Label(
-            frame,
-            text="F6 record    F7 play    F8 stop",
-        ).pack(anchor="w", pady=(4, 12))
+        ttk.Label(frame, textvariable=self.hotkey_hint_var, style="Muted.TLabel").pack(
+            anchor="w", pady=(4, 12)
+        )
 
         options = ttk.Frame(frame)
         options.pack(fill="x")
@@ -193,64 +219,119 @@ class RecorderApp:
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=16)
-        ttk.Button(buttons, text="Record (F6)", command=self.toggle_record).pack(side="left")
-        ttk.Button(buttons, text="Play (F7)", command=self.toggle_playback).pack(
-            side="left", padx=8
+        self.record_btn = theme.RoundedButton(
+            buttons, text="Record (F6)", command=self.toggle_record, colors=self._colors
         )
-        ttk.Button(buttons, text="Stop (F8)", command=self.stop_all).pack(side="left")
+        self.record_btn.pack(side="left")
+        self.play_btn = theme.RoundedButton(
+            buttons, text="Play (F7)", command=self.toggle_playback, colors=self._colors
+        )
+        self.play_btn.pack(side="left", padx=8)
+        self.stop_btn = theme.RoundedButton(
+            buttons, text="Stop (F8)", command=self.stop_all, colors=self._colors
+        )
+        self.stop_btn.pack(side="left")
+        self._rounded_buttons.extend([self.record_btn, self.play_btn, self.stop_btn])
 
-        library = ttk.LabelFrame(frame, text="Macros", padding=8)
-        library.pack(fill="both", expand=True, pady=(0, 8))
+        self.settings_btn = theme.RoundedButton(
+            buttons, text="Settings", command=self._open_settings_menu, colors=self._colors
+        )
+        self.settings_btn.pack(side="right")
+        self._rounded_buttons.append(self.settings_btn)
 
-        list_row = ttk.Frame(library)
-        list_row.pack(fill="both", expand=True)
-        self.macro_list = tk.Listbox(list_row, height=8, exportselection=False)
-        scroll = ttk.Scrollbar(list_row, orient="vertical", command=self.macro_list.yview)
+        self.settings_menu = tk.Menu(self.root, tearoff=0)
+        self.settings_menu.add_checkbutton(
+            label="Dark mode",
+            variable=self.dark_mode_var,
+            command=self._on_dark_mode_toggle,
+        )
+        self.settings_menu.add_checkbutton(
+            label="Check for updates",
+            variable=self.check_updates_var,
+            command=self._on_check_updates_toggle,
+        )
+        self.settings_menu.add_separator()
+        self.settings_menu.add_command(
+            label="Change keybinds…",
+            command=self._open_keybind_dialog,
+        )
+
+        self.macros_panel = theme.RoundedPanel(frame, self._colors, radius=theme.CORNER_RADIUS)
+        self.macros_panel.pack(fill="x", pady=(0, 8))
+        library = self.macros_panel.body
+
+        ttk.Label(library, text="Macros", style="Card.TLabel", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        self.list_row = tk.Frame(library, bg=self._colors["panel"], highlightthickness=0)
+        self.list_row.pack(fill="x")
+        self.macro_list = tk.Listbox(self.list_row, height=1, exportselection=False)
+        scroll = ttk.Scrollbar(self.list_row, orient="vertical", command=self.macro_list.yview)
         self.macro_list.configure(yscrollcommand=scroll.set)
-        self.macro_list.pack(side="left", fill="both", expand=True)
+        self.macro_list.pack(side="left", fill="x", expand=True)
         scroll.pack(side="right", fill="y")
         self.macro_list.bind("<Double-Button-1>", lambda _e: self.load_selected_macro())
 
-        file_btns = ttk.Frame(library)
-        file_btns.pack(fill="x", pady=(8, 0))
-        ttk.Button(file_btns, text="Save", command=self.save_macro).pack(side="left")
-        ttk.Button(file_btns, text="Save As", command=self.save_macro_as).pack(
-            side="left", padx=6
-        )
-        ttk.Button(file_btns, text="Load", command=self.load_selected_macro).pack(side="left")
-        ttk.Button(file_btns, text="Export…", command=self.export_macro).pack(
-            side="left", padx=(12, 6)
-        )
-        ttk.Button(file_btns, text="Import…", command=self.import_macro).pack(side="left")
-
-        settings = ttk.LabelFrame(frame, text="Settings", padding=8)
-        settings.pack(fill="x")
-        ttk.Checkbutton(
-            settings,
-            text="Dark mode",
-            variable=self.dark_mode_var,
-            command=self._on_dark_mode_toggle,
-        ).pack(anchor="w")
-        ttk.Checkbutton(
-            settings,
-            text="Check for updates",
-            variable=self.check_updates_var,
-            command=self._on_check_updates_toggle,
-        ).pack(anchor="w", pady=(4, 0))
+        self.file_btns = tk.Frame(library, bg=self._colors["panel"], highlightthickness=0)
+        self.file_btns.pack(fill="x", pady=(8, 0))
+        file_btns = self.file_btns
+        for text, cmd, padx in (
+            ("Save", self.save_macro, (0, 6)),
+            ("Save As", self.save_macro_as, (0, 6)),
+            ("Load", self.load_selected_macro, (0, 6)),
+            ("Export…", self.export_macro, (6, 6)),
+            ("Import…", self.import_macro, (0, 0)),
+        ):
+            btn = theme.RoundedButton(
+                file_btns, text=text, command=cmd, colors=self._colors, padx=10, pady=5
+            )
+            btn.pack(side="left", padx=padx)
+            self._rounded_buttons.append(btn)
 
         ttk.Label(
             frame,
             wraplength=440,
+            style="Muted.TLabel",
             text="Hooks miss elevated apps. Run this recorder as administrator to control them.",
-        ).pack(anchor="w", pady=(12, 0))
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _open_settings_menu(self):
+        try:
+            self.settings_menu.tk_popup(
+                self.settings_btn.winfo_rootx(),
+                self.settings_btn.winfo_rooty() + self.settings_btn.winfo_height(),
+            )
+        finally:
+            self.settings_menu.grab_release()
 
     def _apply_theme(self):
-        theme.apply_theme(self.root, bool(self.dark_mode_var.get()), self.macro_list)
+        self._colors = theme.apply_theme(
+            self.root, bool(self.dark_mode_var.get()), self.macro_list
+        )
+        if hasattr(self, "macros_panel"):
+            self.macros_panel.set_colors(self._colors)
+        if hasattr(self, "list_row"):
+            self.list_row.configure(bg=self._colors["panel"])
+        if hasattr(self, "file_btns"):
+            self.file_btns.configure(bg=self._colors["panel"])
+        for btn in self._rounded_buttons:
+            btn.set_colors(self._colors)
+        try:
+            self.settings_menu.configure(
+                bg=self._colors["panel"],
+                fg=self._colors["fg"],
+                activebackground=self._colors["select_bg"],
+                activeforeground=self._colors["select_fg"],
+            )
+        except tk.TclError:
+            pass
 
     def _persist_settings(self):
         self.settings["dark_mode"] = bool(self.dark_mode_var.get())
         self.settings["check_for_updates"] = bool(self.check_updates_var.get())
         self.settings["last_macro"] = self.current_macro
+        self.settings["hotkeys"] = hotkeys.normalize_hotkeys(self.hotkey_map)
         appdata.save_settings(self.settings)
 
     def _on_dark_mode_toggle(self):
@@ -266,11 +347,103 @@ class RecorderApp:
         else:
             self._start_update_schedule()
 
+    def _refresh_hotkey_labels(self):
+        self.hotkey_hint_var.set(hotkeys.format_hotkeys_hint(self.hotkey_map))
+        self.record_btn.set_text(f"Record ({hotkeys.format_binding(self.hotkey_map['record'])})")
+        self.play_btn.set_text(f"Play ({hotkeys.format_binding(self.hotkey_map['play'])})")
+        self.stop_btn.set_text(f"Stop ({hotkeys.format_binding(self.hotkey_map['stop'])})")
+
+    def _set_hotkeys(self, new_map: dict) -> bool:
+        error = hotkeys.validate_hotkeys(new_map, hwnd=self._hwnd())
+        if error:
+            messagebox.showwarning("Keybind in use", error, parent=self.root)
+            return False
+        self.hotkey_map = hotkeys.normalize_hotkeys(new_map)
+        self.hotkeys_down.clear()
+        self._refresh_hotkey_labels()
+        self._persist_settings()
+        return True
+
+    def _open_keybind_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Change keybinds")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.configure(bg=self._colors["bg"])
+
+        draft = {action: dict(binding) for action, binding in self.hotkey_map.items()}
+        labels = {}
+        capture_note = tk.StringVar(value="Click a row, then press the new key combo.")
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, textvariable=capture_note).pack(anchor="w", pady=(0, 10))
+
+        rows = ttk.Frame(outer)
+        rows.pack(fill="x")
+
+        def begin_capture(action: str):
+            self._capture_action = action
+            self._capture_callback = on_captured
+            capture_note.set(f"Press a combo for {hotkeys.ACTION_LABELS[action]}… (Esc to cancel)")
+
+        def on_captured(binding: dict | None):
+            action = self._capture_action
+            self._capture_action = None
+            self._capture_callback = None
+            if action is None:
+                return
+            if binding is None:
+                capture_note.set("Capture cancelled.")
+                return
+            draft[action] = binding
+            labels[action].configure(text=hotkeys.format_binding(binding))
+            capture_note.set("Click a row, then press the new key combo.")
+
+        for action in ("record", "play", "stop"):
+            row = ttk.Frame(rows)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text=hotkeys.ACTION_LABELS[action], width=10).pack(side="left")
+            value = ttk.Label(
+                row,
+                text=hotkeys.format_binding(draft[action]),
+                width=18,
+                relief="solid",
+                padding=6,
+            )
+            value.pack(side="left", padx=8)
+            labels[action] = value
+            ttk.Button(
+                row,
+                text="Capture",
+                command=lambda a=action: begin_capture(a),
+            ).pack(side="left")
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(14, 0))
+
+        def apply_and_close():
+            if self._set_hotkeys(draft):
+                dialog.destroy()
+
+        ttk.Button(actions, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(actions, text="Apply", command=apply_and_close).pack(side="right", padx=(0, 8))
+
+        def on_dialog_close():
+            self._capture_action = None
+            self._capture_callback = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        dialog.bind("<Escape>", lambda _e: on_dialog_close())
+
     def _refresh_macro_list(self, select_name=None):
         names = appdata.list_macros()
         self.macro_list.delete(0, tk.END)
         for name in names:
             self.macro_list.insert(tk.END, name)
+        self.macro_list.configure(height=max(1, min(len(names), MACRO_LIST_MAX_ROWS)))
         target = select_name or self.current_macro
         if target and target in names:
             index = names.index(target)
@@ -287,6 +460,7 @@ class RecorderApp:
     def _set_current_macro(self, name):
         self.current_macro = name
         self.settings["last_macro"] = name
+        self.settings["hotkeys"] = hotkeys.normalize_hotkeys(self.hotkey_map)
         appdata.save_settings(self.settings)
         self._refresh_macro_list(select_name=name)
 
@@ -385,7 +559,6 @@ class RecorderApp:
     def export_macro(self):
         payload = self._recording_payload()
         if not payload["events"]:
-            # Prefer exporting the selected library file if buffer empty
             name = self._selected_macro_name() or self.current_macro
             if not name:
                 self.status_var.set("Nothing to export")
@@ -599,20 +772,62 @@ class RecorderApp:
         self._mark_dirty()
 
     def on_key_press(self, key):
-        name = hotkey_name(key)
-        if name:
-            if name in self.hotkeys_down:
+        mod = hotkeys.modifier_name(key)
+        if mod:
+            self.mods_down.add(mod)
+            if self._capture_action:
                 return
-            self.hotkeys_down.add(name)
-            self._post(lambda hotkey=name: self.handle_hotkey(hotkey))
             return
+
+        token = hotkeys.key_token(key)
+        if token is None:
+            return
+
+        if self._capture_action and self._capture_callback:
+            if token in {"esc", "escape"} and not self.mods_down:
+                callback = self._capture_callback
+                self._post(lambda: callback(None))
+                return
+            binding = hotkeys.binding_from_mods_and_key(self.mods_down, token)
+            if binding:
+                callback = self._capture_callback
+                self._post(lambda b=binding: callback(b))
+            return
+
+        action = hotkeys.match_action(self.hotkey_map, self.mods_down, token)
+        if action:
+            if action in self.hotkeys_down:
+                return
+            self.hotkeys_down.add(action)
+            self._post(lambda hotkey=action: self.handle_hotkey(hotkey))
+            return
+
         self._record_key(key, True)
 
     def on_key_release(self, key):
-        name = hotkey_name(key)
-        if name:
-            self.hotkeys_down.discard(name)
+        mod = hotkeys.modifier_name(key)
+        if mod:
+            self.mods_down.discard(mod)
+            if self._capture_action:
+                return
             return
+
+        token = hotkeys.key_token(key)
+        if token is None:
+            return
+
+        if self._capture_action:
+            return
+
+        action = hotkeys.match_action(self.hotkey_map, self.mods_down, token)
+        if action:
+            self.hotkeys_down.discard(action)
+            return
+        # Also clear if the action key alone matches any binding key
+        for name, binding in self.hotkey_map.items():
+            if binding["key"] == token:
+                self.hotkeys_down.discard(name)
+
         self._record_key(key, False)
 
     def _record_key(self, key, pressed):
@@ -626,11 +841,11 @@ class RecorderApp:
         self._mark_dirty()
 
     def handle_hotkey(self, name):
-        if name == "f6":
+        if name == "record":
             self.toggle_record()
-        elif name == "f7":
+        elif name == "play":
             self.toggle_playback()
-        elif name == "f8":
+        elif name == "stop":
             self.stop_all()
 
     def toggle_record(self):
@@ -875,7 +1090,6 @@ class RecorderApp:
                             Path(msi_path).unlink(missing_ok=True)
                         except OSError:
                             pass
-                    # Keep quiet for macros; surface a soft status line only.
                     self.status_var.set("Update failed — try again later")
 
                 self._post(fail)

@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+import hotkeys as hotkey_defs
+
 APP_DIR_NAME = "MacroRecorder"
 SETTINGS_FILE = "settings.json"
 MACROS_DIR_NAME = "macros"
@@ -14,6 +16,7 @@ DEFAULT_SETTINGS = {
     "dark_mode": False,
     "check_for_updates": True,
     "last_macro": None,
+    "hotkeys": hotkey_defs.normalize_hotkeys(None),
 }
 
 
@@ -36,7 +39,12 @@ def settings_path() -> Path:
 
 def load_settings() -> dict:
     path = settings_path()
-    data = dict(DEFAULT_SETTINGS)
+    data = {
+        "dark_mode": DEFAULT_SETTINGS["dark_mode"],
+        "check_for_updates": DEFAULT_SETTINGS["check_for_updates"],
+        "last_macro": DEFAULT_SETTINGS["last_macro"],
+        "hotkeys": hotkey_defs.normalize_hotkeys(None),
+    }
     if not path.is_file():
         return data
     try:
@@ -49,6 +57,7 @@ def load_settings() -> dict:
                 data["check_for_updates"] = bool(loaded["check_for_updates"])
             last = loaded.get("last_macro")
             data["last_macro"] = last if isinstance(last, str) and last else None
+            data["hotkeys"] = hotkey_defs.normalize_hotkeys(loaded.get("hotkeys"))
     except Exception:
         pass
     return data
@@ -62,6 +71,7 @@ def save_settings(settings: dict) -> None:
             settings.get("check_for_updates", DEFAULT_SETTINGS["check_for_updates"])
         ),
         "last_macro": settings.get("last_macro") or None,
+        "hotkeys": hotkey_defs.normalize_hotkeys(settings.get("hotkeys")),
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)

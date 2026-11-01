@@ -134,6 +134,8 @@ class RecorderApp:
         self.pending_update = None
         self.update_in_progress = False
         self._update_timer = None
+        self._manual_update_check = False
+        self.declined_update_version = None
         self.window_focused = True
         self._capture_action = None
         self._capture_callback = None
@@ -246,9 +248,13 @@ class RecorderApp:
             command=self._on_dark_mode_toggle,
         )
         self.settings_menu.add_checkbutton(
-            label="Check for updates",
+            label="Automatically check for updates",
             variable=self.check_updates_var,
             command=self._on_check_updates_toggle,
+        )
+        self.settings_menu.add_command(
+            label="Check now…",
+            command=self._check_for_updates_now,
         )
         self.settings_menu.add_separator()
         self.settings_menu.add_command(
@@ -1011,48 +1017,105 @@ class RecorderApp:
         self._cancel_update_timer()
         if not bool(self.check_updates_var.get()):
             return
-        self._run_update_check_async()
+        self._run_update_check_async(manual=False)
         self._update_timer = self.root.after(UPDATE_INTERVAL_MS, self._on_update_timer)
 
     def _on_update_timer(self):
         self._update_timer = None
         if not bool(self.check_updates_var.get()):
             return
-        self._run_update_check_async()
+        self._run_update_check_async(manual=False)
         self._update_timer = self.root.after(UPDATE_INTERVAL_MS, self._on_update_timer)
 
-    def _run_update_check_async(self):
-        if not bool(self.check_updates_var.get()):
+    def _check_for_updates_now(self):
+        if self.update_in_progress or self._manual_update_check:
             return
+        self.status_var.set("Checking for updates…")
+        self._run_update_check_async(manual=True)
+
+    def _run_update_check_async(self, *, manual: bool):
+        if not manual and not bool(self.check_updates_var.get()):
+            return
+        if manual:
+            self._manual_update_check = True
 
         def worker():
-            pending = updater.check_latest()
-            self._post(lambda: self._on_update_check_result(pending))
+            pending = None
+            error = False
+            try:
+                pending = updater.check_latest()
+            except Exception:
+                error = True
+            self._post(
+                lambda: self._on_update_check_result(pending, manual=manual, error=error)
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_update_check_result(self, pending):
+    def _on_update_check_result(self, pending, *, manual: bool = False, error: bool = False):
+        if manual:
+            self._manual_update_check = False
+            if error:
+                messagebox.showerror(
+                    "Updates",
+                    "Couldn't check for updates. Check your connection and try again.",
+                    parent=self.root,
+                )
+                self.refresh_status()
+                return
+            if pending is None:
+                messagebox.showinfo(
+                    "Updates",
+                    f"You're up to date (v{APP_VERSION}).",
+                    parent=self.root,
+                )
+                self.refresh_status()
+                return
+            if self.declined_update_version == pending.version:
+                self.declined_update_version = None
+            self.pending_update = pending
+            self._maybe_apply_pending_update(manual=True)
+            return
+
         if not bool(self.check_updates_var.get()):
             self.pending_update = None
+            return
+        if error or pending is None:
+            return
+        if pending.version == self.declined_update_version:
             return
         self.pending_update = pending
         self._maybe_apply_pending_update()
 
-    def _maybe_apply_pending_update(self):
+    def _maybe_apply_pending_update(self, manual: bool = False):
         if self.update_in_progress:
             return
-        if not bool(self.check_updates_var.get()):
+        if not manual and not bool(self.check_updates_var.get()):
             return
         if self.pending_update is None:
             return
-        if not self.window_focused:
-            return
-        with self.lock:
-            idle = self.state == "idle"
-        if not idle:
-            return
+        if not manual:
+            if not self.window_focused:
+                return
+            with self.lock:
+                idle = self.state == "idle"
+            if not idle:
+                return
+            if self.pending_update.version == self.declined_update_version:
+                return
+
         pending = self.pending_update
+        if not messagebox.askyesno(
+            "Update available",
+            f"Version {pending.version} is available.\n\nUpdate now?",
+            parent=self.root,
+        ):
+            self.declined_update_version = pending.version
+            self.pending_update = None
+            return
+
         self.pending_update = None
+        self.declined_update_version = None
         self.update_in_progress = True
         self._begin_update(pending)
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
@@ -59,10 +58,12 @@ def _http_json(url: str) -> dict:
 
 
 def check_latest() -> PendingUpdate | None:
-    try:
-        data = _http_json(API_LATEST)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, ValueError):
-        return None
+    """Return a pending update if a newer release exists.
+
+    Raises on network/API failures so callers can distinguish errors from
+    'already up to date'.
+    """
+    data = _http_json(API_LATEST)
     tag = data.get("tag_name") or ""
     if not is_newer(tag):
         return None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import urllib.error
 import urllib.request
@@ -96,6 +97,49 @@ def _http_text(url: str) -> str:
         return response.read().decode("utf-8")
 
 
+def _decode_base64_content(entry: dict) -> str | None:
+    """Decode GitHub Contents API file payload (avoids raw CDN cache)."""
+    encoding = entry.get("encoding")
+    content = entry.get("content")
+    if encoding == "base64" and isinstance(content, str) and content.strip():
+        try:
+            return base64.b64decode(content).decode("utf-8")
+        except Exception:
+            return None
+    return None
+
+
+def _file_entry_payload(entry: dict) -> str | None:
+    """Load one community JSON file's text from a directory listing entry."""
+    text = _decode_base64_content(entry)
+    if text is not None:
+        return text
+    api_url = entry.get("url")
+    if isinstance(api_url, str) and api_url:
+        try:
+            detail = _http_json(api_url)
+        except Exception:
+            detail = None
+        if isinstance(detail, dict):
+            text = _decode_base64_content(detail)
+            if text is not None:
+                return text
+    # Last resort only — raw.githubusercontent.com can lag behind pushes.
+    download_url = entry.get("download_url")
+    if isinstance(download_url, str) and download_url:
+        try:
+            return _http_text(download_url)
+        except Exception:
+            pass
+    name = entry.get("name")
+    if isinstance(name, str) and name:
+        try:
+            return _http_text(f"{RAW_BASE}/{name}")
+        except Exception:
+            pass
+    return None
+
+
 def _parse_macro_payload(name: str, text: str, download_url: str) -> CommunityMacro | None:
     try:
         payload = json.loads(text)
@@ -147,9 +191,8 @@ def list_community_macros(exclude_names: set[str] | None = None) -> list[Communi
         if name.lower() in exclude:
             continue
         download_url = entry.get("download_url") or f"{RAW_BASE}/{name}"
-        try:
-            text = _http_text(download_url)
-        except Exception:
+        text = _file_entry_payload(entry)
+        if text is None:
             continue
         parsed = _parse_macro_payload(name, text, download_url)
         if parsed is not None:

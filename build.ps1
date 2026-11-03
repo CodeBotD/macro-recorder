@@ -84,11 +84,14 @@ if ($Publish) {
     $tag = "v$ProductVersion"
     Write-Host "==> Publishing GitHub Release $tag"
     $releaseExists = $false
-    & gh release view $tag --repo CodeBotD/macro-recorder 1>$null 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $releaseExists = $true
+    try {
+        & gh release view $tag --repo CodeBotD/macro-recorder 1>$null 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $releaseExists = $true
+        }
+    } catch {
+        $releaseExists = $false
     }
-    # PowerShell may treat gh stderr as a terminating error; clear and continue.
     $global:LASTEXITCODE = 0
     if ($releaseExists) {
         Write-Host "Release $tag already exists; uploading/replacing MSI asset"

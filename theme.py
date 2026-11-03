@@ -49,6 +49,20 @@ CUSTOM = {
     "muted": "#8fa89a",
 }
 
+CUSTOM_COLOR_FIELDS = (
+    ("accent", "Accent"),
+    ("bg", "Background"),
+    ("panel", "Panel"),
+    ("fg", "Text"),
+    ("muted", "Muted text"),
+    ("button_bg", "Buttons"),
+    ("button_active", "Buttons (hover)"),
+    ("field_bg", "Fields"),
+    ("border", "Borders"),
+    ("select_bg", "Selection"),
+    ("select_fg", "Selection text"),
+)
+
 CORNER_RADIUS = 12
 BUTTON_RADIUS = 10
 
@@ -60,19 +74,52 @@ def normalize_theme_mode(mode) -> str:
     return "light"
 
 
-def palette(mode: str | bool) -> dict:
+def normalize_hex(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) == 7 and text.startswith("#"):
+        body = text[1:]
+    elif len(text) == 6:
+        body = text
+    else:
+        return None
+    try:
+        int(body, 16)
+    except ValueError:
+        return None
+    return f"#{body.lower()}"
+
+
+def normalize_custom_colors(overrides) -> dict:
+    colors = dict(CUSTOM)
+    if not isinstance(overrides, dict):
+        return colors
+    for key in CUSTOM:
+        hex_color = normalize_hex(overrides.get(key))
+        if hex_color:
+            colors[key] = hex_color
+    return colors
+
+
+def palette(mode: str | bool, custom_colors=None) -> dict:
     if isinstance(mode, bool):
-        return DARK if mode else LIGHT
+        return dict(DARK if mode else LIGHT)
     mode = normalize_theme_mode(mode)
     if mode == "dark":
-        return DARK
+        return dict(DARK)
     if mode == "custom":
-        return CUSTOM
-    return LIGHT
+        return normalize_custom_colors(custom_colors)
+    return dict(LIGHT)
 
 
-def apply_theme(root: tk.Tk, mode: str | bool, listbox: tk.Listbox | None = None) -> dict:
-    colors = palette(mode)
+def apply_theme(
+    root: tk.Tk,
+    mode: str | bool,
+    listbox: tk.Listbox | None = None,
+    custom_colors=None,
+) -> dict:
+    colors = palette(mode, custom_colors=custom_colors)
     style = ttk.Style(root)
     try:
         style.theme_use("clam")

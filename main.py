@@ -9,7 +9,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import appdata
 import community
@@ -156,7 +156,7 @@ class RecorderApp:
 
         self.root = tk.Tk()
         self.root.title(f"Macro recorder v{APP_VERSION}")
-        self.root.minsize(480, 420)
+        self.root.minsize(560, 420)
         self._set_app_icon()
         self.status_var = tk.StringVar(value="Idle — 0 events")
         self.hotkey_hint_var = tk.StringVar(value=hotkeys.format_hotkeys_hint(self.hotkey_map))
@@ -169,6 +169,7 @@ class RecorderApp:
         self.theme_mode_var = tk.StringVar(
             value=theme.normalize_theme_mode(self.settings.get("theme_mode"))
         )
+        self.custom_colors = theme.normalize_custom_colors(self.settings.get("custom_colors"))
         self.check_updates_var = tk.BooleanVar(
             value=bool(self.settings.get("check_for_updates", True))
         )
@@ -240,32 +241,37 @@ class RecorderApp:
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=16)
+        left_btns = ttk.Frame(buttons)
+        left_btns.pack(side="left")
+        right_btns = ttk.Frame(buttons)
+        right_btns.pack(side="right")
+
         self.record_btn = theme.RoundedButton(
-            buttons, text="Record (F6)", command=self.toggle_record, colors=self._colors
+            left_btns, text="Record (F6)", command=self.toggle_record, colors=self._colors
         )
         self.record_btn.pack(side="left")
         self.play_btn = theme.RoundedButton(
-            buttons, text="Play (F7)", command=self.toggle_playback, colors=self._colors
+            left_btns, text="Play (F7)", command=self.toggle_playback, colors=self._colors
         )
-        self.play_btn.pack(side="left", padx=8)
+        self.play_btn.pack(side="left", padx=(10, 0))
         self.stop_btn = theme.RoundedButton(
-            buttons, text="Stop (F8)", command=self.stop_all, colors=self._colors
+            left_btns, text="Stop (F8)", command=self.stop_all, colors=self._colors
         )
-        self.stop_btn.pack(side="left")
+        self.stop_btn.pack(side="left", padx=(10, 0))
         self._rounded_buttons.extend([self.record_btn, self.play_btn, self.stop_btn])
 
-        self.settings_btn = theme.RoundedButton(
-            buttons, text="Settings", command=self._open_settings_menu, colors=self._colors
-        )
-        self.settings_btn.pack(side="right")
         self.community_btn = theme.RoundedButton(
-            buttons,
+            right_btns,
             text="Community mods",
             command=self._open_community_dialog,
             colors=self._colors,
         )
-        self.community_btn.pack(side="right", padx=(0, 8))
-        self._rounded_buttons.extend([self.settings_btn, self.community_btn])
+        self.community_btn.pack(side="left")
+        self.settings_btn = theme.RoundedButton(
+            right_btns, text="Settings", command=self._open_settings_menu, colors=self._colors
+        )
+        self.settings_btn.pack(side="left", padx=(12, 0))
+        self._rounded_buttons.extend([self.community_btn, self.settings_btn])
 
         self.settings_menu = tk.Menu(self.root, tearoff=0)
         self.theme_menu = tk.Menu(self.settings_menu, tearoff=0)
@@ -280,6 +286,11 @@ class RecorderApp:
                 value=mode,
                 command=self._on_theme_mode_change,
             )
+        self.theme_menu.add_separator()
+        self.theme_menu.add_command(
+            label="Customize colors…",
+            command=self._open_custom_colors_dialog,
+        )
         self.settings_menu.add_cascade(label="Theme", menu=self.theme_menu)
         self.settings_menu.add_checkbutton(
             label="Always on top",
@@ -362,7 +373,13 @@ class RecorderApp:
     def _apply_theme(self):
         mode = theme.normalize_theme_mode(self.theme_mode_var.get())
         self.theme_mode_var.set(mode)
-        self._colors = theme.apply_theme(self.root, mode, self.macro_list)
+        self.custom_colors = theme.normalize_custom_colors(self.custom_colors)
+        self._colors = theme.apply_theme(
+            self.root,
+            mode,
+            self.macro_list,
+            custom_colors=self.custom_colors,
+        )
         if hasattr(self, "macros_panel"):
             self.macros_panel.set_colors(self._colors)
         if hasattr(self, "list_row"):
@@ -385,6 +402,7 @@ class RecorderApp:
 
     def _persist_settings(self):
         self.settings["theme_mode"] = theme.normalize_theme_mode(self.theme_mode_var.get())
+        self.settings["custom_colors"] = theme.normalize_custom_colors(self.custom_colors)
         self.settings["check_for_updates"] = bool(self.check_updates_var.get())
         self.settings["always_on_top"] = bool(self.always_on_top_var.get())
         self.settings["last_macro"] = self.current_macro
@@ -396,6 +414,102 @@ class RecorderApp:
     def _on_theme_mode_change(self):
         self._apply_theme()
         self._persist_settings()
+
+    def _open_custom_colors_dialog(self):
+        existing = getattr(self, "_custom_colors_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        draft = theme.normalize_custom_colors(self.custom_colors)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Customize colors")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(bg=self._colors["bg"])
+        self._custom_colors_dialog = dialog
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="These colors apply when Theme is set to Custom.",
+            wraplength=360,
+        ).pack(anchor="w", pady=(0, 10))
+
+        rows = ttk.Frame(outer)
+        rows.pack(fill="x")
+        swatches = {}
+
+        def refresh_swatch(key: str):
+            swatch = swatches.get(key)
+            if swatch is not None:
+                swatch.configure(bg=draft[key])
+
+        def pick_color(key: str, label: str):
+            chosen = colorchooser.askcolor(
+                color=draft[key],
+                title=f"Choose {label}",
+                parent=dialog,
+            )
+            if not chosen or not chosen[1]:
+                return
+            hex_color = theme.normalize_hex(chosen[1])
+            if not hex_color:
+                return
+            draft[key] = hex_color
+            refresh_swatch(key)
+
+        for key, label in theme.CUSTOM_COLOR_FIELDS:
+            row = ttk.Frame(rows)
+            row.pack(fill="x", pady=3)
+            ttk.Label(row, text=label, width=16).pack(side="left")
+            swatch = tk.Frame(
+                row,
+                width=28,
+                height=18,
+                bg=draft[key],
+                highlightthickness=1,
+                highlightbackground=self._colors["border"],
+            )
+            swatch.pack(side="left", padx=(0, 8))
+            swatch.pack_propagate(False)
+            swatches[key] = swatch
+            ttk.Button(
+                row,
+                text="Pick…",
+                command=lambda k=key, lab=label: pick_color(k, lab),
+            ).pack(side="left")
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def apply_draft(switch_to_custom: bool):
+            self.custom_colors = theme.normalize_custom_colors(draft)
+            if switch_to_custom:
+                self.theme_mode_var.set("custom")
+            self._apply_theme()
+            self._persist_settings()
+
+        def on_reset():
+            draft.clear()
+            draft.update(theme.CUSTOM)
+            for key, _label in theme.CUSTOM_COLOR_FIELDS:
+                refresh_swatch(key)
+
+        def on_apply():
+            apply_draft(switch_to_custom=True)
+            dialog.destroy()
+
+        def on_close():
+            self._custom_colors_dialog = None
+            dialog.destroy()
+
+        ttk.Button(btns, text="Reset defaults", command=on_reset).pack(side="left")
+        ttk.Button(btns, text="Cancel", command=on_close).pack(side="right")
+        ttk.Button(btns, text="Apply", command=on_apply).pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
 
     def _apply_always_on_top(self):
         try:
@@ -450,7 +564,12 @@ class RecorderApp:
         self._community_list.configure(yscrollcommand=scroll.set)
         self._community_list.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        theme.apply_theme(self.root, self.theme_mode_var.get(), self._community_list)
+        theme.apply_theme(
+            self.root,
+            self.theme_mode_var.get(),
+            self._community_list,
+            custom_colors=self.custom_colors,
+        )
 
         detail = tk.StringVar(value="Select a macro to see details.")
         ttk.Label(outer, textvariable=detail, wraplength=400, style="Muted.TLabel").pack(

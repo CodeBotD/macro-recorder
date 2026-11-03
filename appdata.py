@@ -15,6 +15,7 @@ MACROS_DIR_NAME = "macros"
 
 DEFAULT_SETTINGS = {
     "theme_mode": "light",
+    "custom_colors": dict(theme.CUSTOM),
     "check_for_updates": True,
     "last_macro": None,
     "hotkeys": hotkey_defs.normalize_hotkeys(None),
@@ -65,6 +66,7 @@ def load_settings() -> dict:
     path = settings_path()
     data = {
         "theme_mode": DEFAULT_SETTINGS["theme_mode"],
+        "custom_colors": dict(DEFAULT_SETTINGS["custom_colors"]),
         "check_for_updates": DEFAULT_SETTINGS["check_for_updates"],
         "last_macro": DEFAULT_SETTINGS["last_macro"],
         "hotkeys": hotkey_defs.normalize_hotkeys(None),
@@ -79,6 +81,7 @@ def load_settings() -> dict:
             loaded = json.load(handle)
         if isinstance(loaded, dict):
             data["theme_mode"] = _theme_mode_from_loaded(loaded)
+            data["custom_colors"] = theme.normalize_custom_colors(loaded.get("custom_colors"))
             if "check_for_updates" in loaded:
                 data["check_for_updates"] = bool(loaded["check_for_updates"])
             last = loaded.get("last_macro")
@@ -102,6 +105,7 @@ def save_settings(settings: dict) -> None:
     )
     payload = {
         "theme_mode": theme_mode,
+        "custom_colors": theme.normalize_custom_colors(settings.get("custom_colors")),
         "check_for_updates": bool(
             settings.get("check_for_updates", DEFAULT_SETTINGS["check_for_updates"])
         ),

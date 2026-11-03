@@ -332,6 +332,14 @@ class RecorderApp:
             anchor="w", pady=(0, 6)
         )
 
+        self.macro_search_var = tk.StringVar(value="")
+        search_row = ttk.Frame(library, style="Card.TFrame")
+        search_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(search_row, text="Search", style="Card.TLabel").pack(side="left")
+        self.macro_search_entry = ttk.Entry(search_row, textvariable=self.macro_search_var)
+        self.macro_search_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.macro_search_var.trace_add("write", lambda *_: self._refresh_macro_list())
+
         self.list_row = tk.Frame(library, bg=self._colors["panel"], highlightthickness=0)
         self.list_row.pack(fill="x")
         self.macro_list = tk.Listbox(self.list_row, height=1, exportselection=False)
@@ -562,9 +570,19 @@ class RecorderApp:
             wraplength=400,
         ).pack(anchor="w", pady=(0, 8))
 
+        self.community_search_var = tk.StringVar(value="")
+        search_row = ttk.Frame(outer)
+        search_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(search_row, text="Search").pack(side="left")
+        ttk.Entry(search_row, textvariable=self.community_search_var).pack(
+            side="left", fill="x", expand=True, padx=(8, 0)
+        )
+        self.community_search_var.trace_add("write", lambda *_: self._refilter_community_list())
+
         list_frame = ttk.Frame(outer)
         list_frame.pack(fill="both", expand=True)
         self._community_list = tk.Listbox(list_frame, exportselection=False, height=10)
+        self._community_visible = []
         scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._community_list.yview)
         self._community_list.configure(yscrollcommand=scroll.set)
         self._community_list.pack(side="left", fill="both", expand=True)
@@ -661,8 +679,33 @@ class RecorderApp:
                 self._community_status or "Select a macro to see details."
             )
             return
-        item = self._community_items[selection[0]]
+        visible = getattr(self, "_community_visible", self._community_items)
+        if selection[0] >= len(visible):
+            return
+        item = visible[selection[0]]
         self._community_detail_var.set(f"By {item.author}\n{item.description}")
+
+    def _refilter_community_list(self):
+        dialog = getattr(self, "_community_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            return
+        query = ""
+        if hasattr(self, "community_search_var"):
+            query = (self.community_search_var.get() or "").strip().lower()
+        visible = []
+        for item in self._community_items:
+            haystack = f"{item.name} {item.author} {item.description}".lower()
+            if query and query not in haystack:
+                continue
+            visible.append(item)
+        self._community_visible = visible
+        self._community_list.delete(0, tk.END)
+        for item in visible:
+            self._community_list.insert(tk.END, f"{item.name}  —  {item.author}")
+        if query and not visible and self._community_items:
+            self._community_detail_var.set(f'No community macros match "{query}".')
+        elif getattr(self, "_community_status", ""):
+            self._community_detail_var.set(self._community_status)
 
     def _refresh_community_list(self):
         dialog = getattr(self, "_community_dialog", None)
@@ -698,24 +741,19 @@ class RecorderApp:
             return
         self._community_items = list(items or [])
         self._community_skipped = list(skipped or [])
-        self._community_list.delete(0, tk.END)
-        for item in self._community_items:
-            self._community_list.insert(tk.END, f"{item.name}  —  {item.author}")
         if error:
             self._community_status = error
-            self._community_detail_var.set(error)
         elif not self._community_items:
             note = "No community macros available to add."
             if self._community_skipped:
                 note += f" Skipped invalid JSON: {', '.join(self._community_skipped)}."
             self._community_status = note
-            self._community_detail_var.set(note)
         else:
             note = f"Checked GitHub online — {len(self._community_items)} available."
             if self._community_skipped:
                 note += f" Skipped invalid JSON: {', '.join(self._community_skipped)}."
-            self._community_status = note
-            self._community_detail_var.set(note + " Select a macro for details.")
+            self._community_status = note + " Select a macro for details."
+        self._refilter_community_list()
 
     def _add_selected_community_macro(self):
         with self.lock:
@@ -735,7 +773,10 @@ class RecorderApp:
                 parent=getattr(self, "_community_dialog", None) or self.root,
             )
             return
-        item = self._community_items[selection[0]]
+        visible = getattr(self, "_community_visible", self._community_items)
+        if selection[0] >= len(visible):
+            return
+        item = visible[selection[0]]
         path = appdata.macro_path(item.name)
         if path.exists():
             if not messagebox.askyesno(
@@ -902,6 +943,11 @@ class RecorderApp:
 
     def _refresh_macro_list(self, select_name=None):
         names = appdata.list_macros()
+        query = ""
+        if hasattr(self, "macro_search_var"):
+            query = (self.macro_search_var.get() or "").strip().lower()
+        if query:
+            names = [name for name in names if query in name.lower()]
         self.macro_list.delete(0, tk.END)
         for name in names:
             self.macro_list.insert(tk.END, name)

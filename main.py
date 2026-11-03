@@ -51,6 +51,7 @@ from pynput.mouse import Button
 
 MOVE_INTERVAL = 1 / 60
 UPDATE_INTERVAL_MS = 30 * 60 * 1000
+COMMUNITY_REFRESH_MS = 60 * 1000
 MACRO_LIST_MAX_ROWS = 8
 UNDO_LIMIT = 30
 
@@ -148,6 +149,9 @@ class RecorderApp:
         self._redo_stack = []
         self._community_dialog = None
         self._community_items = []
+        self._community_skipped = []
+        self._community_refresh_timer = None
+        self._community_status = ""
 
         self.mouse_ctl = mouse.Controller()
         self.key_ctl = keyboard.Controller()
@@ -190,6 +194,7 @@ class RecorderApp:
         self.root.after(50, self._pump)
         self.root.after(200, self._autoload_last_macro)
         self.root.after(1500, self._start_update_schedule)
+        self.root.after(2500, self._prefetch_community_catalog)
 
     def _set_app_icon(self):
         png = resource_path("assets", "app-icon.png")
@@ -553,7 +558,7 @@ class RecorderApp:
         outer.pack(fill="both", expand=True)
         ttk.Label(
             outer,
-            text="Macros from the GitHub community folder. Add installs a copy locally.",
+            text="Always checks GitHub online for community macros. Add copies one into your library.",
             wraplength=400,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -571,7 +576,7 @@ class RecorderApp:
             custom_colors=self.custom_colors,
         )
 
-        detail = tk.StringVar(value="Select a macro to see details.")
+        detail = tk.StringVar(value="Checking GitHub online…")
         ttk.Label(outer, textvariable=detail, wraplength=400, style="Muted.TLabel").pack(
             anchor="w", pady=(8, 0)
         )
@@ -584,19 +589,77 @@ class RecorderApp:
         ttk.Button(btns, text="Add", command=self._add_selected_community_macro).pack(
             side="left", padx=(8, 0)
         )
-        ttk.Button(btns, text="Close", command=dialog.destroy).pack(side="right")
+        ttk.Button(btns, text="Close", command=self._close_community_dialog).pack(side="right")
 
-        def on_close():
-            self._community_dialog = None
+        dialog.protocol("WM_DELETE_WINDOW", self._close_community_dialog)
+        self._refresh_community_list()
+        self._schedule_community_auto_refresh()
+
+    def _close_community_dialog(self):
+        self._cancel_community_auto_refresh()
+        dialog = getattr(self, "_community_dialog", None)
+        self._community_dialog = None
+        if dialog is not None and dialog.winfo_exists():
             dialog.destroy()
 
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
+    def _cancel_community_auto_refresh(self):
+        timer = getattr(self, "_community_refresh_timer", None)
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+            self._community_refresh_timer = None
+
+    def _schedule_community_auto_refresh(self):
+        self._cancel_community_auto_refresh()
+        dialog = getattr(self, "_community_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            return
+        self._community_refresh_timer = self.root.after(
+            COMMUNITY_REFRESH_MS, self._on_community_auto_refresh
+        )
+
+    def _on_community_auto_refresh(self):
+        self._community_refresh_timer = None
+        dialog = getattr(self, "_community_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            return
         self._refresh_community_list()
+        self._schedule_community_auto_refresh()
+
+    def _prefetch_community_catalog(self):
+        """Warm an online GitHub check in the background so Community mods opens faster."""
+
+        def work():
+            try:
+                exclude = set(appdata.list_macros())
+                items, skipped = community.list_community_catalog(exclude_names=exclude)
+                self.ui_queue.put(
+                    lambda: self._store_community_prefetch(items, skipped, None)
+                )
+            except Exception as exc:
+                self.ui_queue.put(
+                    lambda: self._store_community_prefetch([], [], str(exc))
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _store_community_prefetch(self, items, skipped, error):
+        if error:
+            self._community_status = "GitHub check failed (will retry when you open Community mods)."
+            return
+        self._community_items = list(items or [])
+        self._community_skipped = list(skipped or [])
+        count = len(self._community_items)
+        self._community_status = f"Checked GitHub online — {count} community macro(s) available."
 
     def _on_community_select(self, _event=None):
         selection = self._community_list.curselection()
         if not selection:
-            self._community_detail_var.set("Select a macro to see details.")
+            self._community_detail_var.set(
+                self._community_status or "Select a macro to see details."
+            )
             return
         item = self._community_items[selection[0]]
         self._community_detail_var.set(f"By {item.author}\n{item.description}")
@@ -604,42 +667,55 @@ class RecorderApp:
     def _refresh_community_list(self):
         dialog = getattr(self, "_community_dialog", None)
         if dialog is None or not dialog.winfo_exists():
+            # Still allow background online checks without the dialog.
+            self._prefetch_community_catalog()
             return
         self._community_list.delete(0, tk.END)
         self._community_items = []
-        self._community_detail_var.set("Loading community macros…")
+        self._community_detail_var.set("Checking GitHub online…")
         dialog.update_idletasks()
 
         exclude = set(appdata.list_macros())
 
         def work():
             try:
-                items = community.list_community_macros(exclude_names=exclude)
+                items, skipped = community.list_community_catalog(exclude_names=exclude)
                 error = None
             except community.CommunityError as exc:
-                items = []
-                error = str(exc)
+                items, skipped, error = [], [], str(exc)
             except Exception as exc:
-                items = []
-                error = str(exc)
-            self.ui_queue.put(lambda i=items, e=error: self._on_community_loaded(i, e))
+                items, skipped, error = [], [], str(exc)
+            self.ui_queue.put(
+                lambda i=items, s=skipped, e=error: self._on_community_loaded(i, s, e)
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_community_loaded(self, items, error):
+    def _on_community_loaded(self, items, skipped, error):
         dialog = getattr(self, "_community_dialog", None)
         if dialog is None or not dialog.winfo_exists():
+            self._store_community_prefetch(items, skipped, error)
             return
         self._community_items = list(items or [])
+        self._community_skipped = list(skipped or [])
         self._community_list.delete(0, tk.END)
         for item in self._community_items:
             self._community_list.insert(tk.END, f"{item.name}  —  {item.author}")
         if error:
+            self._community_status = error
             self._community_detail_var.set(error)
         elif not self._community_items:
-            self._community_detail_var.set("No community macros available to add.")
+            note = "No community macros available to add."
+            if self._community_skipped:
+                note += f" Skipped invalid JSON: {', '.join(self._community_skipped)}."
+            self._community_status = note
+            self._community_detail_var.set(note)
         else:
-            self._community_detail_var.set("Select a macro to see details.")
+            note = f"Checked GitHub online — {len(self._community_items)} available."
+            if self._community_skipped:
+                note += f" Skipped invalid JSON: {', '.join(self._community_skipped)}."
+            self._community_status = note
+            self._community_detail_var.set(note + " Select a macro for details.")
 
     def _add_selected_community_macro(self):
         with self.lock:

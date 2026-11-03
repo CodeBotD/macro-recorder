@@ -165,10 +165,12 @@ def _parse_macro_payload(name: str, text: str, download_url: str) -> CommunityMa
     )
 
 
-def list_community_macros(exclude_names: set[str] | None = None) -> list[CommunityMacro]:
-    """List community macros from GitHub. Does not write to the local library.
+def list_community_catalog(
+    exclude_names: set[str] | None = None,
+) -> tuple[list[CommunityMacro], list[str]]:
+    """Fetch the live community catalog from GitHub.
 
-    Fetches file contents only to read author/description for the browser list.
+    Does not write into the local library. Returns (macros, skipped_invalid_names).
     """
     exclude = {n.lower() for n in (exclude_names or set())}
     try:
@@ -180,6 +182,7 @@ def list_community_macros(exclude_names: set[str] | None = None) -> list[Communi
         raise CommunityError("Unexpected response from GitHub.")
 
     macros: list[CommunityMacro] = []
+    skipped: list[str] = []
     for entry in listing:
         if not isinstance(entry, dict):
             continue
@@ -193,12 +196,22 @@ def list_community_macros(exclude_names: set[str] | None = None) -> list[Communi
         download_url = entry.get("download_url") or f"{RAW_BASE}/{name}"
         text = _file_entry_payload(entry)
         if text is None:
+            skipped.append(name)
             continue
         parsed = _parse_macro_payload(name, text, download_url)
-        if parsed is not None:
-            macros.append(parsed)
+        if parsed is None:
+            skipped.append(name)
+            continue
+        macros.append(parsed)
 
     macros.sort(key=lambda item: item.name.lower())
+    skipped.sort(key=str.lower)
+    return macros, skipped
+
+
+def list_community_macros(exclude_names: set[str] | None = None) -> list[CommunityMacro]:
+    """List community macros from GitHub. Does not write to the local library."""
+    macros, _skipped = list_community_catalog(exclude_names=exclude_names)
     return macros
 
 
@@ -206,6 +219,15 @@ def fetch_macro_text(item: CommunityMacro) -> str:
     """Return JSON text for installing. Uses cached raw_text when available."""
     if item.raw_text:
         return item.raw_text
+    api_url = f"{CONTENTS_URL}/{item.name}"
+    try:
+        detail = _http_json(api_url)
+        if isinstance(detail, dict):
+            text = _decode_base64_content(detail)
+            if text:
+                return text
+    except Exception:
+        pass
     try:
         return _http_text(item.download_url)
     except Exception as exc:

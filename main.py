@@ -1222,24 +1222,32 @@ class RecorderApp:
 
         def worker():
             pending = None
-            error = False
+            error_message = None
             try:
                 pending = updater.check_latest()
+            except updater.UpdateCheckError as exc:
+                error_message = str(exc)
             except Exception:
-                error = True
+                error_message = (
+                    "Couldn't check for updates. Check your connection and try again."
+                )
             self._post(
-                lambda: self._on_update_check_result(pending, manual=manual, error=error)
+                lambda: self._on_update_check_result(
+                    pending, manual=manual, error_message=error_message
+                )
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_update_check_result(self, pending, *, manual: bool = False, error: bool = False):
+    def _on_update_check_result(
+        self, pending, *, manual: bool = False, error_message: str | None = None
+    ):
         if manual:
             self._manual_update_check = False
-            if error:
+            if error_message:
                 messagebox.showerror(
                     "Updates",
-                    "Couldn't check for updates. Check your connection and try again.",
+                    error_message,
                     parent=self.root,
                 )
                 self.refresh_status()
@@ -1261,7 +1269,7 @@ class RecorderApp:
         if not bool(self.check_updates_var.get()):
             self.pending_update = None
             return
-        if error or pending is None:
+        if error_message or pending is None:
             return
         if pending.version == self.declined_update_version:
             return

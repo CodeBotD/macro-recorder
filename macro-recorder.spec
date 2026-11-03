@@ -14,6 +14,11 @@ datas += tmp_ret[0]
 binaries += tmp_ret[1]
 hiddenimports += tmp_ret[2]
 
+tmp_certifi = collect_all("certifi")
+datas += tmp_certifi[0]
+binaries += tmp_certifi[1]
+hiddenimports += tmp_certifi[2]
+
 a = Analysis(
     ["main.py"],
     pathex=[],

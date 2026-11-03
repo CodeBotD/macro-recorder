@@ -88,6 +88,8 @@ if ($Publish) {
     if ($LASTEXITCODE -eq 0) {
         $releaseExists = $true
     }
+    # PowerShell may treat gh stderr as a terminating error; clear and continue.
+    $global:LASTEXITCODE = 0
     if ($releaseExists) {
         Write-Host "Release $tag already exists; uploading/replacing MSI asset"
         & gh release upload $tag $MsiPath --repo CodeBotD/macro-recorder --clobber

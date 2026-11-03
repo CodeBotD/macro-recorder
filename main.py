@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import appdata
+import community
 import hotkeys
 import theme
 import updater
@@ -145,6 +146,8 @@ class RecorderApp:
         self._colors = theme.LIGHT
         self._undo_stack = []
         self._redo_stack = []
+        self._community_dialog = None
+        self._community_items = []
 
         self.mouse_ctl = mouse.Controller()
         self.key_ctl = keyboard.Controller()
@@ -163,7 +166,9 @@ class RecorderApp:
         self.loop_var = tk.BooleanVar(
             value=bool(self.settings.get("loop_until_stopped", False))
         )
-        self.dark_mode_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
+        self.theme_mode_var = tk.StringVar(
+            value=theme.normalize_theme_mode(self.settings.get("theme_mode"))
+        )
         self.check_updates_var = tk.BooleanVar(
             value=bool(self.settings.get("check_for_updates", True))
         )
@@ -253,14 +258,29 @@ class RecorderApp:
             buttons, text="Settings", command=self._open_settings_menu, colors=self._colors
         )
         self.settings_btn.pack(side="right")
-        self._rounded_buttons.append(self.settings_btn)
+        self.community_btn = theme.RoundedButton(
+            buttons,
+            text="Community mods",
+            command=self._open_community_dialog,
+            colors=self._colors,
+        )
+        self.community_btn.pack(side="right", padx=(0, 8))
+        self._rounded_buttons.extend([self.settings_btn, self.community_btn])
 
         self.settings_menu = tk.Menu(self.root, tearoff=0)
-        self.settings_menu.add_checkbutton(
-            label="Dark mode",
-            variable=self.dark_mode_var,
-            command=self._on_dark_mode_toggle,
-        )
+        self.theme_menu = tk.Menu(self.settings_menu, tearoff=0)
+        for mode, label in (
+            ("light", "Light"),
+            ("dark", "Dark"),
+            ("custom", "Custom"),
+        ):
+            self.theme_menu.add_radiobutton(
+                label=label,
+                variable=self.theme_mode_var,
+                value=mode,
+                command=self._on_theme_mode_change,
+            )
+        self.settings_menu.add_cascade(label="Theme", menu=self.theme_menu)
         self.settings_menu.add_checkbutton(
             label="Always on top",
             variable=self.always_on_top_var,
@@ -284,6 +304,9 @@ class RecorderApp:
             label="Open app folder…",
             command=self._open_app_folder,
         )
+        self.settings_menu.add_separator()
+        self.settings_menu.add_command(label="Undo", command=self.undo_library)
+        self.settings_menu.add_command(label="Redo", command=self.redo_library)
 
         self.macros_panel = theme.RoundedPanel(frame, self._colors, radius=theme.CORNER_RADIUS)
         self.macros_panel.pack(fill="x", pady=(0, 8))
@@ -312,9 +335,7 @@ class RecorderApp:
             ("Load", self.load_selected_macro, (0, 6)),
             ("Delete", self.delete_macro, (0, 6)),
             ("Export…", self.export_macro, (6, 6)),
-            ("Import…", self.import_macro, (0, 6)),
-            ("Undo", self.undo_library, (6, 6)),
-            ("Redo", self.redo_library, (0, 0)),
+            ("Import…", self.import_macro, (0, 0)),
         ):
             btn = theme.RoundedButton(
                 file_btns, text=text, command=cmd, colors=self._colors, padx=10, pady=5
@@ -339,9 +360,9 @@ class RecorderApp:
             self.settings_menu.grab_release()
 
     def _apply_theme(self):
-        self._colors = theme.apply_theme(
-            self.root, bool(self.dark_mode_var.get()), self.macro_list
-        )
+        mode = theme.normalize_theme_mode(self.theme_mode_var.get())
+        self.theme_mode_var.set(mode)
+        self._colors = theme.apply_theme(self.root, mode, self.macro_list)
         if hasattr(self, "macros_panel"):
             self.macros_panel.set_colors(self._colors)
         if hasattr(self, "list_row"):
@@ -351,17 +372,19 @@ class RecorderApp:
         for btn in self._rounded_buttons:
             btn.set_colors(self._colors)
         try:
-            self.settings_menu.configure(
-                bg=self._colors["panel"],
-                fg=self._colors["fg"],
-                activebackground=self._colors["select_bg"],
-                activeforeground=self._colors["select_fg"],
-            )
+            menu_kwargs = {
+                "bg": self._colors["panel"],
+                "fg": self._colors["fg"],
+                "activebackground": self._colors["select_bg"],
+                "activeforeground": self._colors["select_fg"],
+            }
+            self.settings_menu.configure(**menu_kwargs)
+            self.theme_menu.configure(**menu_kwargs)
         except tk.TclError:
             pass
 
     def _persist_settings(self):
-        self.settings["dark_mode"] = bool(self.dark_mode_var.get())
+        self.settings["theme_mode"] = theme.normalize_theme_mode(self.theme_mode_var.get())
         self.settings["check_for_updates"] = bool(self.check_updates_var.get())
         self.settings["always_on_top"] = bool(self.always_on_top_var.get())
         self.settings["last_macro"] = self.current_macro
@@ -370,7 +393,7 @@ class RecorderApp:
         self.settings["loop_until_stopped"] = bool(self.loop_var.get())
         appdata.save_settings(self.settings)
 
-    def _on_dark_mode_toggle(self):
+    def _on_theme_mode_change(self):
         self._apply_theme()
         self._persist_settings()
 
@@ -394,6 +417,182 @@ class RecorderApp:
                 f"Could not open folder:\n{path}",
                 parent=self.root,
             )
+
+    def _open_community_dialog(self):
+        existing = getattr(self, "_community_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            self._refresh_community_list()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Community mods")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.minsize(420, 320)
+        dialog.configure(bg=self._colors["bg"])
+        self._community_dialog = dialog
+        self._community_items = []
+
+        outer = ttk.Frame(dialog, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text="Macros from the GitHub community folder. Add installs a copy locally.",
+            wraplength=400,
+        ).pack(anchor="w", pady=(0, 8))
+
+        list_frame = ttk.Frame(outer)
+        list_frame.pack(fill="both", expand=True)
+        self._community_list = tk.Listbox(list_frame, exportselection=False, height=10)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._community_list.yview)
+        self._community_list.configure(yscrollcommand=scroll.set)
+        self._community_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        theme.apply_theme(self.root, self.theme_mode_var.get(), self._community_list)
+
+        detail = tk.StringVar(value="Select a macro to see details.")
+        ttk.Label(outer, textvariable=detail, wraplength=400, style="Muted.TLabel").pack(
+            anchor="w", pady=(8, 0)
+        )
+        self._community_detail_var = detail
+        self._community_list.bind("<<ListboxSelect>>", self._on_community_select)
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Refresh", command=self._refresh_community_list).pack(side="left")
+        ttk.Button(btns, text="Add", command=self._add_selected_community_macro).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(btns, text="Close", command=dialog.destroy).pack(side="right")
+
+        def on_close():
+            self._community_dialog = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        self._refresh_community_list()
+
+    def _on_community_select(self, _event=None):
+        selection = self._community_list.curselection()
+        if not selection:
+            self._community_detail_var.set("Select a macro to see details.")
+            return
+        item = self._community_items[selection[0]]
+        self._community_detail_var.set(f"By {item.author}\n{item.description}")
+
+    def _refresh_community_list(self):
+        dialog = getattr(self, "_community_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            return
+        self._community_list.delete(0, tk.END)
+        self._community_items = []
+        self._community_detail_var.set("Loading community macros…")
+        dialog.update_idletasks()
+
+        exclude = set(appdata.list_macros())
+
+        def work():
+            try:
+                items = community.list_community_macros(exclude_names=exclude)
+                error = None
+            except community.CommunityError as exc:
+                items = []
+                error = str(exc)
+            except Exception as exc:
+                items = []
+                error = str(exc)
+            self.ui_queue.put(lambda i=items, e=error: self._on_community_loaded(i, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_community_loaded(self, items, error):
+        dialog = getattr(self, "_community_dialog", None)
+        if dialog is None or not dialog.winfo_exists():
+            return
+        self._community_items = list(items or [])
+        self._community_list.delete(0, tk.END)
+        for item in self._community_items:
+            self._community_list.insert(tk.END, f"{item.name}  —  {item.author}")
+        if error:
+            self._community_detail_var.set(error)
+        elif not self._community_items:
+            self._community_detail_var.set("No community macros available to add.")
+        else:
+            self._community_detail_var.set("Select a macro to see details.")
+
+    def _add_selected_community_macro(self):
+        with self.lock:
+            busy = self.state != "idle"
+        if busy:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Stop recording or playback before adding a community macro.",
+                parent=self.root,
+            )
+            return
+        selection = self._community_list.curselection()
+        if not selection:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Select a community macro to add.",
+                parent=getattr(self, "_community_dialog", None) or self.root,
+            )
+            return
+        item = self._community_items[selection[0]]
+        path = appdata.macro_path(item.name)
+        if path.exists():
+            if not messagebox.askyesno(
+                "Macro recorder",
+                f'"{path.name}" already exists. Overwrite?',
+                parent=getattr(self, "_community_dialog", None) or self.root,
+            ):
+                return
+        try:
+            text = community.fetch_macro_text(item)
+            payload = json.loads(text)
+            events = payload.get("events")
+            if not isinstance(events, list) or not all(valid_event(e) for e in events):
+                raise ValueError("invalid events")
+        except community.CommunityError as exc:
+            messagebox.showerror(
+                "Macro recorder",
+                str(exc),
+                parent=getattr(self, "_community_dialog", None) or self.root,
+            )
+            return
+        except Exception:
+            messagebox.showerror(
+                "Macro recorder",
+                "That community file is not a valid recording.",
+                parent=getattr(self, "_community_dialog", None) or self.root,
+            )
+            return
+
+        install = {"events": [dict(event) for event in events]}
+        author = payload.get("author")
+        description = payload.get("description")
+        if isinstance(author, str) and author.strip():
+            install["author"] = author.strip()
+        if isinstance(description, str) and description.strip():
+            install["description"] = description.strip()
+
+        before = path.read_text(encoding="utf-8") if path.is_file() else None
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(install, handle, indent=2)
+        after = path.read_text(encoding="utf-8")
+        self._push_undo(
+            {
+                "name": path.name,
+                "before": before,
+                "after": after,
+                "was_current": False,
+            }
+        )
+        self._refresh_macro_list(select_name=path.name)
+        self._refresh_community_list()
+        self.status_var.set(f"Added community macro {path.name}")
 
     def _on_playback_settings_change(self, *_args):
         self._persist_settings()
@@ -573,6 +772,7 @@ class RecorderApp:
             else:
                 self._refresh_macro_list(select_name=path.name)
         self.refresh_status()
+        self._refresh_community_list()
 
     def undo_library(self):
         if not self._undo_stack:
@@ -701,6 +901,7 @@ class RecorderApp:
             self._persist_settings()
         self._refresh_macro_list()
         self.refresh_status()
+        self._refresh_community_list()
 
     def load_selected_macro(self):
         name = self._selected_macro_name()

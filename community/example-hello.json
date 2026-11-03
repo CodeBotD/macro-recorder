@@ -1,0 +1,8 @@
+{
+  "author": "CodeBotD",
+  "description": "Example community macro: types the letter H then releases it.",
+  "events": [
+    { "dt": 0.0, "type": "key", "key": "char:h", "pressed": true },
+    { "dt": 0.08, "type": "key", "key": "char:h", "pressed": false }
+  ]
+}

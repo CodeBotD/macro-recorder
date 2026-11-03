@@ -1,0 +1,169 @@
+"""Fetch community macros from the GitHub community/ folder."""
+
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+from version import APP_VERSION, GITHUB_REPO
+
+USER_AGENT = f"MacroRecorder/{APP_VERSION}"
+CONTENTS_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/community"
+RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/community"
+
+
+class CommunityError(Exception):
+    """Raised when community macros cannot be listed or fetched."""
+
+
+@dataclass
+class CommunityMacro:
+    name: str
+    author: str
+    description: str
+    download_url: str
+    raw_text: str | None = None
+
+
+def _ssl_context():
+    try:
+        import certifi
+        import ssl
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        import ssl
+
+        context = ssl.create_default_context()
+        try:
+            context.load_default_certs()
+        except Exception:
+            pass
+        return context
+
+
+def _friendly_network_error(exc: BaseException) -> str:
+    if isinstance(exc, TimeoutError) or isinstance(exc, urllib.error.URLError) and isinstance(
+        getattr(exc, "reason", None), TimeoutError
+    ):
+        return "Timed out reaching GitHub. Try again later."
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403:
+            return "GitHub rate-limited the request. Try again in a few minutes."
+        if exc.code == 404:
+            return "Community macros folder was not found on GitHub."
+        return f"GitHub returned HTTP {exc.code}."
+    text = str(exc).lower()
+    if "certificate" in text or "ssl" in text or "tls" in text:
+        return (
+            "Secure connection to GitHub failed. "
+            "A firewall, proxy, or antivirus may be blocking Macro Recorder."
+        )
+    if isinstance(exc, urllib.error.URLError):
+        return (
+            "Could not reach GitHub. "
+            "Check Wi‑Fi, or allow Macro Recorder through Windows Firewall."
+        )
+    return "Couldn't load community macros. Check your connection and try again."
+
+
+def _http_open(url: str, *, timeout: float = 20, headers: dict | None = None):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            **(headers or {}),
+        },
+    )
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context())
+
+
+def _http_json(url: str):
+    with _http_open(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    ) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _http_text(url: str) -> str:
+    with _http_open(url) as response:
+        return response.read().decode("utf-8")
+
+
+def _parse_macro_payload(name: str, text: str, download_url: str) -> CommunityMacro | None:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return None
+    author = payload.get("author")
+    description = payload.get("description")
+    return CommunityMacro(
+        name=name,
+        author=author.strip() if isinstance(author, str) and author.strip() else "Unknown",
+        description=(
+            description.strip()
+            if isinstance(description, str) and description.strip()
+            else "No description"
+        ),
+        download_url=download_url,
+        raw_text=text,
+    )
+
+
+def list_community_macros(exclude_names: set[str] | None = None) -> list[CommunityMacro]:
+    """List community macros from GitHub. Does not write to the local library.
+
+    Fetches file contents only to read author/description for the browser list.
+    """
+    exclude = {n.lower() for n in (exclude_names or set())}
+    try:
+        listing = _http_json(CONTENTS_URL)
+    except Exception as exc:
+        raise CommunityError(_friendly_network_error(exc)) from exc
+
+    if not isinstance(listing, list):
+        raise CommunityError("Unexpected response from GitHub.")
+
+    macros: list[CommunityMacro] = []
+    for entry in listing:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("type") != "file":
+            continue
+        name = entry.get("name") or ""
+        if not isinstance(name, str) or not name.lower().endswith(".json"):
+            continue
+        if name.lower() in exclude:
+            continue
+        download_url = entry.get("download_url") or f"{RAW_BASE}/{name}"
+        try:
+            text = _http_text(download_url)
+        except Exception:
+            continue
+        parsed = _parse_macro_payload(name, text, download_url)
+        if parsed is not None:
+            macros.append(parsed)
+
+    macros.sort(key=lambda item: item.name.lower())
+    return macros
+
+
+def fetch_macro_text(item: CommunityMacro) -> str:
+    """Return JSON text for installing. Uses cached raw_text when available."""
+    if item.raw_text:
+        return item.raw_text
+    try:
+        return _http_text(item.download_url)
+    except Exception as exc:
+        raise CommunityError(_friendly_network_error(exc)) from exc

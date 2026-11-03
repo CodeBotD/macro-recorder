@@ -7,13 +7,14 @@ import os
 from pathlib import Path
 
 import hotkeys as hotkey_defs
+import theme
 
 APP_DIR_NAME = "MacroRecorder"
 SETTINGS_FILE = "settings.json"
 MACROS_DIR_NAME = "macros"
 
 DEFAULT_SETTINGS = {
-    "dark_mode": False,
+    "theme_mode": "light",
     "check_for_updates": True,
     "last_macro": None,
     "hotkeys": hotkey_defs.normalize_hotkeys(None),
@@ -52,10 +53,18 @@ def clamp_repeat(value) -> int:
     return repeat
 
 
+def _theme_mode_from_loaded(loaded: dict) -> str:
+    if "theme_mode" in loaded:
+        return theme.normalize_theme_mode(loaded.get("theme_mode"))
+    if "dark_mode" in loaded:
+        return "dark" if bool(loaded.get("dark_mode")) else "light"
+    return DEFAULT_SETTINGS["theme_mode"]
+
+
 def load_settings() -> dict:
     path = settings_path()
     data = {
-        "dark_mode": DEFAULT_SETTINGS["dark_mode"],
+        "theme_mode": DEFAULT_SETTINGS["theme_mode"],
         "check_for_updates": DEFAULT_SETTINGS["check_for_updates"],
         "last_macro": DEFAULT_SETTINGS["last_macro"],
         "hotkeys": hotkey_defs.normalize_hotkeys(None),
@@ -69,8 +78,7 @@ def load_settings() -> dict:
         with path.open("r", encoding="utf-8") as handle:
             loaded = json.load(handle)
         if isinstance(loaded, dict):
-            if "dark_mode" in loaded:
-                data["dark_mode"] = bool(loaded["dark_mode"])
+            data["theme_mode"] = _theme_mode_from_loaded(loaded)
             if "check_for_updates" in loaded:
                 data["check_for_updates"] = bool(loaded["check_for_updates"])
             last = loaded.get("last_macro")
@@ -89,8 +97,11 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> None:
     path = settings_path()
+    theme_mode = theme.normalize_theme_mode(
+        settings.get("theme_mode", DEFAULT_SETTINGS["theme_mode"])
+    )
     payload = {
-        "dark_mode": bool(settings.get("dark_mode", DEFAULT_SETTINGS["dark_mode"])),
+        "theme_mode": theme_mode,
         "check_for_updates": bool(
             settings.get("check_for_updates", DEFAULT_SETTINGS["check_for_updates"])
         ),

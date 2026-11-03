@@ -1,9 +1,11 @@
-"""Light and dark ttk themes for the recorder UI."""
+"""Light, dark, and custom ttk themes for the recorder UI."""
 
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
+
+THEME_MODES = ("light", "dark", "custom")
 
 LIGHT = {
     "bg": "#f0f2f5",
@@ -33,16 +35,44 @@ DARK = {
     "muted": "#9aa3ad",
 }
 
+CUSTOM = {
+    "bg": "#1b2420",
+    "fg": "#e6f0ea",
+    "field_bg": "#24302a",
+    "select_bg": "#3d5c4a",
+    "select_fg": "#f2faf5",
+    "button_bg": "#2f3f36",
+    "button_active": "#3d5246",
+    "border": "#4a6356",
+    "accent": "#3ecf8e",
+    "panel": "#222e28",
+    "muted": "#8fa89a",
+}
+
 CORNER_RADIUS = 12
 BUTTON_RADIUS = 10
 
 
-def palette(dark: bool) -> dict:
-    return DARK if dark else LIGHT
+def normalize_theme_mode(mode) -> str:
+    text = str(mode or "").strip().lower()
+    if text in THEME_MODES:
+        return text
+    return "light"
 
 
-def apply_theme(root: tk.Tk, dark: bool, listbox: tk.Listbox | None = None) -> dict:
-    colors = palette(dark)
+def palette(mode: str | bool) -> dict:
+    if isinstance(mode, bool):
+        return DARK if mode else LIGHT
+    mode = normalize_theme_mode(mode)
+    if mode == "dark":
+        return DARK
+    if mode == "custom":
+        return CUSTOM
+    return LIGHT
+
+
+def apply_theme(root: tk.Tk, mode: str | bool, listbox: tk.Listbox | None = None) -> dict:
+    colors = palette(mode)
     style = ttk.Style(root)
     try:
         style.theme_use("clam")

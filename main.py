@@ -2,6 +2,7 @@
 
 import ctypes
 import json
+import os
 import queue
 import sys
 import threading
@@ -50,6 +51,7 @@ from pynput.mouse import Button
 MOVE_INTERVAL = 1 / 60
 UPDATE_INTERVAL_MS = 30 * 60 * 1000
 MACRO_LIST_MAX_ROWS = 8
+UNDO_LIMIT = 30
 
 
 def resource_path(*parts: str) -> Path:
@@ -141,6 +143,8 @@ class RecorderApp:
         self._capture_callback = None
         self._rounded_buttons = []
         self._colors = theme.LIGHT
+        self._undo_stack = []
+        self._redo_stack = []
 
         self.mouse_ctl = mouse.Controller()
         self.key_ctl = keyboard.Controller()
@@ -153,16 +157,26 @@ class RecorderApp:
         self._set_app_icon()
         self.status_var = tk.StringVar(value="Idle — 0 events")
         self.hotkey_hint_var = tk.StringVar(value=hotkeys.format_hotkeys_hint(self.hotkey_map))
-        self.repeat_var = tk.StringVar(value="1")
-        self.loop_var = tk.BooleanVar(value=False)
+        self.repeat_var = tk.StringVar(
+            value=str(appdata.clamp_repeat(self.settings.get("repeat", 1)))
+        )
+        self.loop_var = tk.BooleanVar(
+            value=bool(self.settings.get("loop_until_stopped", False))
+        )
         self.dark_mode_var = tk.BooleanVar(value=bool(self.settings.get("dark_mode")))
         self.check_updates_var = tk.BooleanVar(
             value=bool(self.settings.get("check_for_updates", True))
         )
+        self.always_on_top_var = tk.BooleanVar(
+            value=bool(self.settings.get("always_on_top", False))
+        )
         self._build_ui()
         self._apply_theme()
+        self._apply_always_on_top()
         self._refresh_hotkey_labels()
         self._refresh_macro_list(select_name=self.settings.get("last_macro"))
+        self.repeat_var.trace_add("write", self._on_playback_settings_change)
+        self.loop_var.trace_add("write", self._on_playback_settings_change)
         self._start_listeners()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<FocusIn>", self._on_focus_in)
@@ -248,6 +262,11 @@ class RecorderApp:
             command=self._on_dark_mode_toggle,
         )
         self.settings_menu.add_checkbutton(
+            label="Always on top",
+            variable=self.always_on_top_var,
+            command=self._on_always_on_top_toggle,
+        )
+        self.settings_menu.add_checkbutton(
             label="Automatically check for updates",
             variable=self.check_updates_var,
             command=self._on_check_updates_toggle,
@@ -261,6 +280,10 @@ class RecorderApp:
             label="Change keybinds…",
             command=self._open_keybind_dialog,
         )
+        self.settings_menu.add_command(
+            label="Open app folder…",
+            command=self._open_app_folder,
+        )
 
         self.macros_panel = theme.RoundedPanel(frame, self._colors, radius=theme.CORNER_RADIUS)
         self.macros_panel.pack(fill="x", pady=(0, 8))
@@ -273,10 +296,11 @@ class RecorderApp:
         self.list_row = tk.Frame(library, bg=self._colors["panel"], highlightthickness=0)
         self.list_row.pack(fill="x")
         self.macro_list = tk.Listbox(self.list_row, height=1, exportselection=False)
-        scroll = ttk.Scrollbar(self.list_row, orient="vertical", command=self.macro_list.yview)
-        self.macro_list.configure(yscrollcommand=scroll.set)
+        self.macro_scroll = ttk.Scrollbar(
+            self.list_row, orient="vertical", command=self.macro_list.yview
+        )
+        self.macro_list.configure(yscrollcommand=self.macro_scroll.set)
         self.macro_list.pack(side="left", fill="x", expand=True)
-        scroll.pack(side="right", fill="y")
         self.macro_list.bind("<Double-Button-1>", lambda _e: self.load_selected_macro())
 
         self.file_btns = tk.Frame(library, bg=self._colors["panel"], highlightthickness=0)
@@ -286,8 +310,11 @@ class RecorderApp:
             ("Save", self.save_macro, (0, 6)),
             ("Save As", self.save_macro_as, (0, 6)),
             ("Load", self.load_selected_macro, (0, 6)),
+            ("Delete", self.delete_macro, (0, 6)),
             ("Export…", self.export_macro, (6, 6)),
-            ("Import…", self.import_macro, (0, 0)),
+            ("Import…", self.import_macro, (0, 6)),
+            ("Undo", self.undo_library, (6, 6)),
+            ("Redo", self.redo_library, (0, 0)),
         ):
             btn = theme.RoundedButton(
                 file_btns, text=text, command=cmd, colors=self._colors, padx=10, pady=5
@@ -336,12 +363,39 @@ class RecorderApp:
     def _persist_settings(self):
         self.settings["dark_mode"] = bool(self.dark_mode_var.get())
         self.settings["check_for_updates"] = bool(self.check_updates_var.get())
+        self.settings["always_on_top"] = bool(self.always_on_top_var.get())
         self.settings["last_macro"] = self.current_macro
         self.settings["hotkeys"] = hotkeys.normalize_hotkeys(self.hotkey_map)
+        self.settings["repeat"] = appdata.clamp_repeat(self.repeat_var.get())
+        self.settings["loop_until_stopped"] = bool(self.loop_var.get())
         appdata.save_settings(self.settings)
 
     def _on_dark_mode_toggle(self):
         self._apply_theme()
+        self._persist_settings()
+
+    def _apply_always_on_top(self):
+        try:
+            self.root.attributes("-topmost", bool(self.always_on_top_var.get()))
+        except tk.TclError:
+            pass
+
+    def _on_always_on_top_toggle(self):
+        self._apply_always_on_top()
+        self._persist_settings()
+
+    def _open_app_folder(self):
+        path = appdata.app_root()
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception:
+            messagebox.showerror(
+                "Macro recorder",
+                f"Could not open folder:\n{path}",
+                parent=self.root,
+            )
+
+    def _on_playback_settings_change(self, *_args):
         self._persist_settings()
 
     def _on_check_updates_toggle(self):
@@ -444,12 +498,21 @@ class RecorderApp:
         dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
         dialog.bind("<Escape>", lambda _e: on_dialog_close())
 
+    def _update_macro_scrollbar(self, count: int):
+        if count > MACRO_LIST_MAX_ROWS:
+            if not self.macro_scroll.winfo_manager():
+                self.macro_scroll.pack(side="right", fill="y")
+        else:
+            if self.macro_scroll.winfo_manager():
+                self.macro_scroll.pack_forget()
+
     def _refresh_macro_list(self, select_name=None):
         names = appdata.list_macros()
         self.macro_list.delete(0, tk.END)
         for name in names:
             self.macro_list.insert(tk.END, name)
         self.macro_list.configure(height=max(1, min(len(names), MACRO_LIST_MAX_ROWS)))
+        self._update_macro_scrollbar(len(names))
         target = select_name or self.current_macro
         if target and target in names:
             index = names.index(target)
@@ -465,9 +528,7 @@ class RecorderApp:
 
     def _set_current_macro(self, name):
         self.current_macro = name
-        self.settings["last_macro"] = name
-        self.settings["hotkeys"] = hotkeys.normalize_hotkeys(self.hotkey_map)
-        appdata.save_settings(self.settings)
+        self._persist_settings()
         self._refresh_macro_list(select_name=name)
 
     def _recording_payload(self):
@@ -476,10 +537,73 @@ class RecorderApp:
                 self._flush_pending_move()
             return {"events": [dict(event) for event in self.events]}
 
+    def _push_undo(self, entry: dict):
+        self._undo_stack.append(entry)
+        if len(self._undo_stack) > UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _apply_library_entry(self, name: str, content: str | None, was_current: bool):
+        path = appdata.macro_path(name)
+        if content is None:
+            if path.is_file():
+                path.unlink()
+            if self.current_macro == name or was_current:
+                self.current_macro = None
+                self.settings["last_macro"] = None
+                with self.lock:
+                    self.events = []
+                    self.pending_pos = None
+                self._persist_settings()
+            self._refresh_macro_list()
+        else:
+            path.write_text(content, encoding="utf-8")
+            if was_current or self.current_macro == name:
+                try:
+                    events = read_recording(path)
+                except Exception:
+                    events = None
+                if events is not None:
+                    with self.lock:
+                        self.events = events
+                        self.pending_pos = None
+                    self._set_current_macro(path.name)
+                else:
+                    self._refresh_macro_list(select_name=path.name)
+            else:
+                self._refresh_macro_list(select_name=path.name)
+        self.refresh_status()
+
+    def undo_library(self):
+        if not self._undo_stack:
+            self.status_var.set("Nothing to undo")
+            return
+        entry = self._undo_stack.pop()
+        self._apply_library_entry(entry["name"], entry["before"], entry.get("was_current", False))
+        self._redo_stack.append(entry)
+
+    def redo_library(self):
+        if not self._redo_stack:
+            self.status_var.set("Nothing to redo")
+            return
+        entry = self._redo_stack.pop()
+        self._apply_library_entry(entry["name"], entry["after"], entry.get("was_current", False))
+        self._undo_stack.append(entry)
+
     def _write_macro_file(self, name, payload):
         path = appdata.macro_path(name)
+        before = path.read_text(encoding="utf-8") if path.is_file() else None
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+        after = path.read_text(encoding="utf-8")
+        self._push_undo(
+            {
+                "name": path.name,
+                "before": before,
+                "after": after,
+                "was_current": True,
+            }
+        )
         self._set_current_macro(path.name)
         self.refresh_status()
 
@@ -517,6 +641,66 @@ class RecorderApp:
             ):
                 return
         self._write_macro_file(safe, payload)
+
+    def delete_macro(self):
+        with self.lock:
+            busy = self.state != "idle"
+        if busy:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Stop recording or playback before deleting.",
+                parent=self.root,
+            )
+            return
+        name = self._selected_macro_name() or self.current_macro
+        if not name:
+            messagebox.showinfo(
+                "Macro recorder",
+                "Select a macro to delete.",
+                parent=self.root,
+            )
+            return
+        path = appdata.macro_path(name)
+        if not path.is_file():
+            messagebox.showinfo(
+                "Macro recorder",
+                "That macro file was not found.",
+                parent=self.root,
+            )
+            self._refresh_macro_list()
+            return
+        if not messagebox.askyesno(
+            "Macro recorder",
+            f'Delete "{path.name}"?',
+            parent=self.root,
+        ):
+            return
+        before = path.read_text(encoding="utf-8")
+        was_current = self.current_macro == path.name
+        if not appdata.delete_macro(path.name):
+            messagebox.showerror(
+                "Macro recorder",
+                "Could not delete that macro.",
+                parent=self.root,
+            )
+            return
+        self._push_undo(
+            {
+                "name": path.name,
+                "before": before,
+                "after": None,
+                "was_current": was_current,
+            }
+        )
+        if was_current:
+            self.current_macro = None
+            self.settings["last_macro"] = None
+            with self.lock:
+                self.events = []
+                self.pending_pos = None
+            self._persist_settings()
+        self._refresh_macro_list()
+        self.refresh_status()
 
     def load_selected_macro(self):
         name = self._selected_macro_name()
@@ -643,13 +827,10 @@ class RecorderApp:
             ):
                 return
         payload = {"events": events}
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
         with self.lock:
             self.events = [dict(event) for event in events]
             self.pending_pos = None
-        self._set_current_macro(safe)
-        self.refresh_status()
+        self._write_macro_file(safe, payload)
 
     def _start_listeners(self):
         self.mouse_listener = mouse.Listener(

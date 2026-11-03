@@ -17,6 +17,9 @@ DEFAULT_SETTINGS = {
     "check_for_updates": True,
     "last_macro": None,
     "hotkeys": hotkey_defs.normalize_hotkeys(None),
+    "repeat": 1,
+    "loop_until_stopped": False,
+    "always_on_top": False,
 }
 
 
@@ -37,6 +40,18 @@ def settings_path() -> Path:
     return app_root() / SETTINGS_FILE
 
 
+def clamp_repeat(value) -> int:
+    try:
+        repeat = int(value)
+    except (TypeError, ValueError):
+        repeat = DEFAULT_SETTINGS["repeat"]
+    if repeat < 1:
+        return 1
+    if repeat > 9999:
+        return 9999
+    return repeat
+
+
 def load_settings() -> dict:
     path = settings_path()
     data = {
@@ -44,6 +59,9 @@ def load_settings() -> dict:
         "check_for_updates": DEFAULT_SETTINGS["check_for_updates"],
         "last_macro": DEFAULT_SETTINGS["last_macro"],
         "hotkeys": hotkey_defs.normalize_hotkeys(None),
+        "repeat": DEFAULT_SETTINGS["repeat"],
+        "loop_until_stopped": DEFAULT_SETTINGS["loop_until_stopped"],
+        "always_on_top": DEFAULT_SETTINGS["always_on_top"],
     }
     if not path.is_file():
         return data
@@ -58,6 +76,12 @@ def load_settings() -> dict:
             last = loaded.get("last_macro")
             data["last_macro"] = last if isinstance(last, str) and last else None
             data["hotkeys"] = hotkey_defs.normalize_hotkeys(loaded.get("hotkeys"))
+            if "repeat" in loaded:
+                data["repeat"] = clamp_repeat(loaded.get("repeat"))
+            if "loop_until_stopped" in loaded:
+                data["loop_until_stopped"] = bool(loaded["loop_until_stopped"])
+            if "always_on_top" in loaded:
+                data["always_on_top"] = bool(loaded["always_on_top"])
     except Exception:
         pass
     return data
@@ -72,6 +96,13 @@ def save_settings(settings: dict) -> None:
         ),
         "last_macro": settings.get("last_macro") or None,
         "hotkeys": hotkey_defs.normalize_hotkeys(settings.get("hotkeys")),
+        "repeat": clamp_repeat(settings.get("repeat", DEFAULT_SETTINGS["repeat"])),
+        "loop_until_stopped": bool(
+            settings.get("loop_until_stopped", DEFAULT_SETTINGS["loop_until_stopped"])
+        ),
+        "always_on_top": bool(
+            settings.get("always_on_top", DEFAULT_SETTINGS["always_on_top"])
+        ),
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -89,6 +120,14 @@ def macro_path(name: str) -> Path:
     if not name.lower().endswith(".json"):
         name += ".json"
     return macros_dir() / name
+
+
+def delete_macro(name: str) -> bool:
+    path = macro_path(name)
+    if not path.is_file():
+        return False
+    path.unlink()
+    return True
 
 
 def sanitize_macro_name(name: str) -> str | None:
